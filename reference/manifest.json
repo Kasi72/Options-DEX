@@ -1,0 +1,14 @@
+{
+  "files": [
+    {
+      "source_path": "C:\\Users\\drkkr\\Downloads\\app.py",
+      "copied_path": "reference/original_app.py",
+      "sha256": "4C7DC443C60321C452E615CC2FB904C2DF9C68E1BE044D617239A49DDB5C8C63"
+    },
+    {
+      "source_path": "C:\\Users\\drkkr\\Downloads\\nifty_vol_gex_dex_log.csv",
+      "copied_path": "reference/nifty_vol_gex_dex_log.csv",
+      "sha256": "E9D828EB4FF44506097BF7C2D3FD63A161E3DC4EFE499FFB5898957D6EB5F1A0"
+    }
+  ]
+}
