@@ -14,6 +14,7 @@ from nifty_signal_engine.domain.exposure import (
 )
 from nifty_signal_engine.domain.market import OptionChainSnapshot, OptionQuote
 from nifty_signal_engine.domain.signal import ResearchSignal, SignalAction
+from tests.factories import aware
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -53,6 +54,12 @@ def test_snapshot_requires_timezone_aware_timestamps() -> None:
             expiry=date(2026, 9, 1),
             quotes=(quote,),
         )
+
+
+def test_factory_rejects_naive_iso_timestamps() -> None:
+    """Host-local timezone parsing must not create a market-data timestamp."""
+    with pytest.raises(ValueError, match="timezone-aware"):
+        aware("2026-08-26T09:16:00")
 
 
 def test_instruments_runtime_and_domain_results_are_immutable() -> None:

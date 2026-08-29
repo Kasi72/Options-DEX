@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "Precision-first NIFTY and BANKNIFTY options research engine."
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
+dependencies = [
+    "pydantic>=2",
+]
 
 [project.optional-dependencies]
 dev = [

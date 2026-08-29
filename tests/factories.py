@@ -8,7 +8,10 @@ IST = ZoneInfo("Asia/Kolkata")
 
 
 def aware(value: str) -> datetime:
-    return datetime.fromisoformat(value).astimezone(IST)
+    timestamp = datetime.fromisoformat(value)
+    if timestamp.tzinfo is None:
+        raise ValueError("timestamp must be timezone-aware")
+    return timestamp.astimezone(IST)
 
 
 def make_quote(
