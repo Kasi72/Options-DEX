@@ -35,6 +35,25 @@ def test_rejects_non_positive_required_inputs(
             black_scholes_greeks(100.0, 100.0, 0.25, 0.07, invalid_value, "CE")
 
 
+@pytest.mark.parametrize("invalid_value", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("parameter", ["spot", "strike", "years", "rate", "volatility"])
+def test_rejects_non_finite_numeric_inputs(
+    parameter: str, invalid_value: float
+) -> None:
+    """Catch NaN or infinite inputs that would contaminate Greek exposures."""
+    with pytest.raises(ValueError):
+        if parameter == "spot":
+            black_scholes_greeks(invalid_value, 100.0, 0.25, 0.07, 0.20, "CE")
+        elif parameter == "strike":
+            black_scholes_greeks(100.0, invalid_value, 0.25, 0.07, 0.20, "CE")
+        elif parameter == "years":
+            black_scholes_greeks(100.0, 100.0, invalid_value, 0.07, 0.20, "CE")
+        elif parameter == "rate":
+            black_scholes_greeks(100.0, 100.0, 0.25, invalid_value, 0.20, "CE")
+        else:
+            black_scholes_greeks(100.0, 100.0, 0.25, 0.07, invalid_value, "CE")
+
+
 @given(
     spot=st.floats(min_value=90.0, max_value=110.0, allow_nan=False),
     strike=st.floats(min_value=90.0, max_value=110.0, allow_nan=False),

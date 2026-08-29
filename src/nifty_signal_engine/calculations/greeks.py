@@ -1,7 +1,7 @@
 """Black-Scholes Greek calculations."""
 
 from dataclasses import dataclass
-from math import exp, log, sqrt
+from math import exp, isfinite, log, sqrt
 from typing import Literal
 
 from scipy.stats import norm  # type: ignore[import-untyped]
@@ -29,7 +29,7 @@ def black_scholes_greeks(
     option_type: OptionType,
 ) -> Greeks:
     """Return prototype-compatible Black-Scholes Greeks for a call or put."""
-    _validate_positive_inputs(spot, strike, years, volatility)
+    _validate_numeric_inputs(spot, strike, years, rate, volatility)
     if option_type not in {"CE", "PE"}:
         raise ValueError("option_type must be 'CE' or 'PE'")
 
@@ -57,9 +57,18 @@ def black_scholes_greeks(
     )
 
 
-def _validate_positive_inputs(
-    spot: float, strike: float, years: float, volatility: float
+def _validate_numeric_inputs(
+    spot: float, strike: float, years: float, rate: float, volatility: float
 ) -> None:
+    for name, value in (
+        ("spot", spot),
+        ("strike", strike),
+        ("years", years),
+        ("rate", rate),
+        ("volatility", volatility),
+    ):
+        if not isfinite(value):
+            raise ValueError(f"{name} must be finite")
     if spot <= 0:
         raise ValueError("spot must be positive")
     if strike <= 0:
