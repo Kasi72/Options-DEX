@@ -33,7 +33,17 @@ class ExposureResult(BaseModel, frozen=True):
         return self.net_gex_rupees / 10_000_000
 
     @property
+    def net_gex_crore(self) -> float:
+        """Return net gamma exposure in crore without an extra scale factor."""
+        return self.net_gex_rupees / 10_000_000
+
+    @property
     def dex_crore(self) -> float:
+        return self.net_dex_rupees / 10_000_000
+
+    @property
+    def net_dex_crore(self) -> float:
+        """Return net delta exposure in crore without an extra scale factor."""
         return self.net_dex_rupees / 10_000_000
 
 
