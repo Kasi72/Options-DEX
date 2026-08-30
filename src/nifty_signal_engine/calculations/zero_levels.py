@@ -89,7 +89,10 @@ def _finite_objective_value(
         return None
     if not isinstance(value, Real) or isinstance(value, bool):
         return None
-    numeric_value = float(value)
+    try:
+        numeric_value = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
     return numeric_value if isfinite(numeric_value) else None
 
 
@@ -101,8 +104,11 @@ def _normalise_bounds(lower: object, upper: object) -> tuple[float, float] | Non
         or isinstance(upper, bool)
     ):
         return None
-    lower_bound = float(lower)
-    upper_bound = float(upper)
+    try:
+        lower_bound = float(lower)
+        upper_bound = float(upper)
+    except (OverflowError, TypeError, ValueError):
+        return None
     if not isfinite(lower_bound) or not isfinite(upper_bound) or lower_bound >= upper_bound:
         return None
     return lower_bound, upper_bound

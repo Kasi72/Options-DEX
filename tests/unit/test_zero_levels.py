@@ -98,3 +98,17 @@ def test_near_discontinuous_root_with_nonzero_jump_is_numerical_error() -> None:
 
     assert result.level is None
     assert result.status is ZeroLevelStatus.NUMERICAL_ERROR
+
+
+def test_overflowing_real_bounds_return_numerical_error() -> None:
+    result = find_zero_level(lambda x: x, 10**400, 10**401)
+
+    assert result.level is None
+    assert result.status is ZeroLevelStatus.NUMERICAL_ERROR
+
+
+def test_overflowing_objective_value_returns_numerical_error() -> None:
+    result = find_zero_level(lambda x: 10**400 if x < 0.5 else -1.0, 0.0, 1.0)
+
+    assert result.level is None
+    assert result.status is ZeroLevelStatus.NUMERICAL_ERROR
