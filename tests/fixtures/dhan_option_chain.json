@@ -1,0 +1,41 @@
+{
+  "data": {
+    "last_price": 24318.5,
+    "oc": {
+      "24300.000000": {
+        "ce": {
+          "greeks": {"delta": 0.54, "gamma": 0.0012},
+          "implied_volatility": 12.5,
+          "last_price": 151.2,
+          "oi": 120000,
+          "previous_oi": 118000,
+          "top_bid_price": 150.5,
+          "top_ask_price": 151.5,
+          "volume": 450000
+        },
+        "pe": {
+          "greeks": {"delta": -0.46, "gamma": 0.0011},
+          "implied_volatility": 13.75,
+          "last_price": 132.8,
+          "oi": 115000,
+          "previous_oi": 113000,
+          "top_bid_price": 132.4,
+          "top_ask_price": 133.0,
+          "volume": 410000
+        }
+      },
+      "24400.000000": {
+        "ce": {
+          "greeks": {"delta": 0.31, "gamma": 0.0010},
+          "implied_volatility": 14.0,
+          "last_price": 94.4,
+          "oi": 95000,
+          "previous_oi": 92000,
+          "top_bid_price": 94.0,
+          "top_ask_price": 95.0,
+          "volume": 300000
+        }
+      }
+    }
+  }
+}
