@@ -1,9 +1,10 @@
 """Small, credential-injected boundary for Dhan option-chain responses."""
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Callable, Literal
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 import httpx

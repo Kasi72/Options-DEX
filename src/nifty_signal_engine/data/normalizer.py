@@ -4,14 +4,12 @@ import json
 import math
 from datetime import datetime
 from typing import Literal, cast
-from zoneinfo import ZoneInfo
 
 from nifty_signal_engine.data.dhan_client import BrokerPayloadError, RawSnapshot
 from nifty_signal_engine.domain.market import OptionChainSnapshot, OptionQuote
 
 
 Instrument = Literal["NIFTY", "BANKNIFTY"]
-IST = ZoneInfo("Asia/Kolkata")
 _SIDES: tuple[tuple[str, Literal["CE", "PE"]], ...] = (("ce", "CE"), ("pe", "PE"))
 
 
@@ -19,8 +17,10 @@ def normalize_option_chain(
     raw: RawSnapshot, instrument: Instrument, received_at: datetime
 ) -> OptionChainSnapshot:
     """Normalize one response only when every present contract is unambiguous."""
-    _require_kolkata_timestamp(received_at, "received_at")
-    _require_kolkata_timestamp(raw.captured_at, "captured_at")
+    _require_aware_timestamp(received_at, "received_at")
+    _require_aware_timestamp(raw.captured_at, "captured_at")
+    if received_at < raw.captured_at:
+        raise BrokerPayloadError("received_at cannot precede captured_at")
     if raw.expiry is None:
         raise BrokerPayloadError("raw option chain must retain its requested expiry")
     try:
@@ -36,6 +36,7 @@ def normalize_option_chain(
         raise BrokerPayloadError("option chain has no strikes")
 
     quotes: list[OptionQuote] = []
+    contract_identities: set[tuple[float, Literal["CE", "PE"]]] = set()
     for raw_strike, raw_sides in strikes.items():
         strike = _strike(raw_strike)
         sides = _object(raw_sides, f"strike {raw_strike}")
@@ -43,6 +44,10 @@ def normalize_option_chain(
         for key, option_type in _SIDES:
             if key in sides:
                 present += 1
+                identity = (strike, option_type)
+                if identity in contract_identities:
+                    raise BrokerPayloadError("duplicate option contract")
+                contract_identities.add(identity)
                 quotes.append(
                     _quote(
                         _object(sides[key], f"{raw_strike}.{key}"),
@@ -134,10 +139,10 @@ def _integer(value: object, field: str, *, nonnegative: bool) -> int:
     return value
 
 
-def _require_kolkata_timestamp(value: datetime, field: str) -> None:
+def _require_aware_timestamp(value: datetime, field: str) -> None:
     if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
         raise BrokerPayloadError(f"{field} must be timezone-aware")
-    if getattr(value.tzinfo, "key", None) != IST.key or value.fold:
+    if value.fold:
         raise BrokerPayloadError(
-            f"{field} must be an unambiguous Asia/Kolkata timestamp"
+            f"{field} must be an unambiguous timezone-aware timestamp"
         )

@@ -81,3 +81,43 @@ def test_normalizer_rejects_naive_received_timestamp() -> None:
             "NIFTY",
             datetime(2026, 8, 30, 10, 1),  # noqa: DTZ001 - intentional invalid input
         )
+
+
+def test_normalizer_rejects_duplicate_normalized_contract_identity() -> None:
+    payload = json.loads((FIXTURES / "dhan_option_chain.json").read_text())
+    payload["data"]["oc"]["24300.0"] = {
+        "ce": payload["data"]["oc"]["24300.000000"]["ce"]
+    }
+    raw = RawSnapshot(
+        body=json.dumps(payload).encode(),
+        captured_at=datetime(2026, 8, 30, 10, 0, tzinfo=IST),
+        expiry=date(2026, 9, 1),
+    )
+
+    with pytest.raises(BrokerPayloadError, match="duplicate option contract"):
+        normalize_option_chain(raw, "NIFTY", datetime(2026, 8, 30, 10, 1, tzinfo=IST))
+
+
+def test_normalizer_rejects_received_at_before_capture() -> None:
+    raw = RawSnapshot(
+        body=(FIXTURES / "dhan_option_chain.json").read_bytes(),
+        captured_at=datetime(2026, 8, 30, 10, 0, tzinfo=IST),
+        expiry=date(2026, 9, 1),
+    )
+
+    with pytest.raises(BrokerPayloadError, match="received_at cannot precede"):
+        normalize_option_chain(raw, "NIFTY", datetime(2026, 8, 30, 9, 59, tzinfo=IST))
+
+
+def test_normalizer_compares_aware_timestamps_as_absolute_instants() -> None:
+    raw = RawSnapshot(
+        body=(FIXTURES / "dhan_option_chain.json").read_bytes(),
+        captured_at=datetime(2026, 8, 30, 10, 0, tzinfo=IST),
+        expiry=date(2026, 9, 1),
+    )
+
+    snapshot = normalize_option_chain(
+        raw, "NIFTY", datetime.fromisoformat("2026-08-30T04:30:00+00:00")
+    )
+
+    assert snapshot.received_at == raw.captured_at

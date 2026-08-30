@@ -1,5 +1,6 @@
 import asyncio
 import json
+import tomllib
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -15,6 +16,13 @@ from nifty_signal_engine.data.dhan_client import (
 
 IST = ZoneInfo("Asia/Kolkata")
 FIXTURES = Path(__file__).parents[1] / "fixtures"
+ROOT = Path(__file__).parents[2]
+
+
+def test_project_declares_httpx_runtime_dependency() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+
+    assert any(dependency.startswith("httpx>=") for dependency in project["project"]["dependencies"])
 
 
 def test_fetch_expiries_uses_exchange_metadata_and_correct_nifty_request() -> None:
