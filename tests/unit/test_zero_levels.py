@@ -1,5 +1,7 @@
 """Tests for honest zero-exposure levels."""
 
+import pytest
+
 from nifty_signal_engine.calculations.zero_levels import find_zero_level
 from nifty_signal_engine.domain.exposure import ZeroLevelStatus
 
@@ -63,6 +65,36 @@ def test_tangent_endpoint_is_not_fabricated_as_a_crossing() -> None:
 
 def test_invalid_objective_return_type_is_numerical_error() -> None:
     result = find_zero_level(lambda _: "not-a-number", 23_000, 25_000)  # type: ignore[return-value]
+
+    assert result.level is None
+    assert result.status is ZeroLevelStatus.NUMERICAL_ERROR
+
+
+@pytest.mark.parametrize("error", [RuntimeError("source failed"), KeyError("missing")])
+def test_ordinary_objective_exceptions_return_numerical_error(
+    error: Exception,
+) -> None:
+    def objective(_: float) -> float:
+        raise error
+
+    result = find_zero_level(objective, 23_000, 25_000)
+
+    assert result.level is None
+    assert result.status is ZeroLevelStatus.NUMERICAL_ERROR
+
+
+@pytest.mark.parametrize("lower", ["23_000", True])
+def test_non_real_or_boolean_bounds_return_numerical_error(lower: object) -> None:
+    result = find_zero_level(lambda x: x - 24_000, lower, 25_000)  # type: ignore[arg-type]
+
+    assert result.level is None
+    assert result.status is ZeroLevelStatus.NUMERICAL_ERROR
+
+
+def test_near_discontinuous_root_with_nonzero_jump_is_numerical_error() -> None:
+    result = find_zero_level(
+        lambda x: x - 0.5 if x < 0.5 else x - 0.5 + 1e-10, 0.0, 1.0
+    )
 
     assert result.level is None
     assert result.status is ZeroLevelStatus.NUMERICAL_ERROR
