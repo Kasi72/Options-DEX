@@ -19,11 +19,13 @@ class IncrementalSnapshot:
     incremental_put_volume: int | None
     cross_session: bool
     counter_reset: bool = False
+    out_of_order: bool = False
 
 
 @dataclass(slots=True)
 class _CounterState:
     session: date
+    timestamp: datetime
     call_volume: int
     put_volume: int
 
@@ -45,7 +47,16 @@ class SessionState:
             quote.volume for quote in snapshot.quotes if quote.option_type == "PE"
         )
         previous = self._states.get(instrument)
-        self._states[instrument] = _CounterState(current_session, call_volume, put_volume)
+
+        if previous is not None and timestamp <= previous.timestamp:
+            return IncrementalSnapshot(
+                instrument, timestamp, current_session, None, None, None, False,
+                out_of_order=True,
+            )
+
+        self._states[instrument] = _CounterState(
+            current_session, timestamp, call_volume, put_volume
+        )
 
         if previous is None or previous.session != current_session:
             return IncrementalSnapshot(

@@ -35,3 +35,35 @@ def test_instruments_keep_independent_counters() -> None:
     state.update(nifty)
     first_bank = state.update(bank)
     assert first_bank.incremental_volume is None
+
+
+def test_out_of_order_snapshot_is_rejected_without_mutating_baseline() -> None:
+    state = SessionState()
+    state.update(make_chain(timestamp="2026-08-26T09:15:00+05:30", call_volume=100))
+    state.update(make_chain(timestamp="2026-08-26T09:16:00+05:30", call_volume=200))
+    late = state.update(make_chain(timestamp="2026-08-26T09:15:00+05:30", call_volume=100))
+    assert late.incremental_volume is None
+    assert late.out_of_order is True
+    result = state.update(make_chain(timestamp="2026-08-26T09:17:00+05:30", call_volume=250))
+    assert result.incremental_volume == 50
+
+
+def test_equal_timestamp_replay_is_rejected_without_mutating_baseline() -> None:
+    state = SessionState()
+    state.update(make_chain(timestamp="2026-08-26T09:15:00+05:30", call_volume=100))
+    state.update(make_chain(timestamp="2026-08-26T09:16:00+05:30", call_volume=200))
+    replay = state.update(make_chain(timestamp="2026-08-26T09:16:00+05:30", call_volume=300))
+    assert replay.incremental_volume is None
+    assert replay.out_of_order is True
+    result = state.update(make_chain(timestamp="2026-08-26T09:17:00+05:30", call_volume=250))
+    assert result.incremental_volume == 50
+
+
+def test_counter_reset_rebaselines_for_next_in_order_snapshot() -> None:
+    state = SessionState()
+    state.update(make_chain(timestamp="2026-08-26T09:15:00+05:30", call_volume=200))
+    reset = state.update(make_chain(timestamp="2026-08-26T09:16:00+05:30", call_volume=10))
+    assert reset.counter_reset is True
+    assert reset.incremental_volume is None
+    result = state.update(make_chain(timestamp="2026-08-26T09:17:00+05:30", call_volume=25))
+    assert result.incremental_volume == 15
