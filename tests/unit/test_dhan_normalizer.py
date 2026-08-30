@@ -121,3 +121,26 @@ def test_normalizer_compares_aware_timestamps_as_absolute_instants() -> None:
     )
 
     assert snapshot.received_at == raw.captured_at
+
+
+def test_normalizer_canonicalizes_aware_timestamps_to_india() -> None:
+    raw = RawSnapshot(
+        body=(FIXTURES / "dhan_option_chain.json").read_bytes(),
+        captured_at=datetime.fromisoformat("2026-08-30T04:30:00+00:00"),
+        expiry=date(2026, 9, 1),
+    )
+
+    snapshot = normalize_option_chain(
+        raw, "NIFTY", datetime.fromisoformat("2026-08-30T04:30:01+00:00")
+    )
+
+    assert getattr(snapshot.source_timestamp.tzinfo, "key", None) == "Asia/Kolkata"
+    assert getattr(snapshot.received_at.tzinfo, "key", None) == "Asia/Kolkata"
+    assert snapshot.source_timestamp.isoformat() == "2026-08-30T10:00:00+05:30"
+    assert snapshot.received_at.isoformat() == "2026-08-30T10:00:01+05:30"
+    assert {getattr(quote.timestamp.tzinfo, "key", None) for quote in snapshot.quotes} == {
+        "Asia/Kolkata"
+    }
+    assert {quote.timestamp.isoformat() for quote in snapshot.quotes} == {
+        "2026-08-30T10:00:00+05:30"
+    }

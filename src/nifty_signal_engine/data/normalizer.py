@@ -4,12 +4,14 @@ import json
 import math
 from datetime import datetime
 from typing import Literal, cast
+from zoneinfo import ZoneInfo
 
 from nifty_signal_engine.data.dhan_client import BrokerPayloadError, RawSnapshot
 from nifty_signal_engine.domain.market import OptionChainSnapshot, OptionQuote
 
 
 Instrument = Literal["NIFTY", "BANKNIFTY"]
+IST = ZoneInfo("Asia/Kolkata")
 _SIDES: tuple[tuple[str, Literal["CE", "PE"]], ...] = (("ce", "CE"), ("pe", "PE"))
 
 
@@ -21,6 +23,8 @@ def normalize_option_chain(
     _require_aware_timestamp(raw.captured_at, "captured_at")
     if received_at < raw.captured_at:
         raise BrokerPayloadError("received_at cannot precede captured_at")
+    captured_at = raw.captured_at.astimezone(IST)
+    received_at_ist = received_at.astimezone(IST)
     if raw.expiry is None:
         raise BrokerPayloadError("raw option chain must retain its requested expiry")
     try:
@@ -54,14 +58,15 @@ def normalize_option_chain(
                         strike,
                         option_type,
                         raw,
+                        captured_at,
                     )
                 )
         if present == 0:
             raise BrokerPayloadError(f"strike {raw_strike} has no option side")
     return OptionChainSnapshot(
         instrument=instrument,
-        source_timestamp=raw.captured_at,
-        received_at=received_at,
+        source_timestamp=captured_at,
+        received_at=received_at_ist,
         spot=spot,
         expiry=raw.expiry,
         quotes=tuple(quotes),
@@ -73,6 +78,7 @@ def _quote(
     strike: float,
     option_type: Literal["CE", "PE"],
     raw: RawSnapshot,
+    timestamp: datetime,
 ) -> OptionQuote:
     bid = _number(side.get("top_bid_price"), "top_bid_price", nonnegative=True)
     ask = _number(side.get("top_ask_price"), "top_ask_price", nonnegative=True)
@@ -85,7 +91,7 @@ def _quote(
     if iv_percent > 100:
         raise BrokerPayloadError("implied_volatility must be a percentage in (0, 100]")
     return OptionQuote(
-        timestamp=raw.captured_at,
+        timestamp=timestamp,
         strike=strike,
         option_type=option_type,
         expiry=raw.expiry,
