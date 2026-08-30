@@ -1,6 +1,7 @@
 # Task 5 report: session-safe rolling statistics and state
 
 Implementation commit: `f94f520f13b79d33eb89de613ffe0fa5d4ac77da`
+Review-fix commit: `4cc857ebb15af9bbe0f82a250e7e4abcafefd25e`
 
 ## Evidence
 
@@ -9,6 +10,9 @@ Implementation commit: `f94f520f13b79d33eb89de613ffe0fa5d4ac77da`
 - Full unit suite: `py -m pytest -q` — 72 passed.
 - Ruff: `py -m ruff check src tests` — all checks passed.
 - Mypy: `py -m mypy src` — no issues found in 15 source files.
+- Review-fix focused run: `py -m pytest tests/unit/test_session_state.py tests/unit/test_rolling.py -v` — 11 passed.
+- Post-fix full suite: `py -m pytest -q` — 75 passed.
+- Post-fix Ruff and mypy — all checks passed; no issues found in 15 source files.
 
 ## Changes
 
@@ -19,3 +23,4 @@ Implementation commit: `f94f520f13b79d33eb89de613ffe0fa5d4ac77da`
 ## Concerns
 
 - Incremental state currently aggregates quote volumes by option type across the snapshot. Strike-level incremental state can be added when downstream feature contracts require it.
+- Out-of-order and equal-timestamp snapshots return `out_of_order=True` without mutating baselines. In-order counter decreases return `counter_reset=True`, rebaseline, and make the current delta unavailable.
