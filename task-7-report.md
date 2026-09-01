@@ -20,6 +20,19 @@
 - `py -m ruff check src tests` — passed.
 - `py -m mypy src` — passed for 20 source files.
 - `py -m pytest tests/unit -v` — passed, 85 tests.
+
+## Review correction round 2
+
+- Existing v1 databases are now compared to a deterministic PRAGMA contract generated from the code-defined SQLAlchemy metadata. The comparison covers every table's declared types, nullability, primary-key positions, defaults, indexes/unique constraints, and foreign-key column/target/action semantics.
+- A second constructor that observed a missing database rechecks the schema inside the `BEGIN IMMEDIATE` initialization lock. If another writer has installed v1, it validates and recovers rather than inserting a duplicate schema-version row.
+
+### Correction-round evidence
+
+- RED: nullable `TEXT` spot, missing normalized raw-snapshot FK, missing unique index, and simultaneous pristine initialization all failed against commit `557f72e`.
+- GREEN: `py -m pytest tests/integration/test_repositories.py -v` passed `20` tests.
+- `py -m ruff check src tests` — passed.
+- `py -m mypy src` — passed for 20 source files.
+- `py -m pytest tests/unit -v` — passed, 85 tests.
 - `py -m pytest tests/integration/test_repositories.py -v` — passed, 7 tests.
 - `py -m pip install --dry-run .` — resolves `sqlalchemy>=2.0` and `pyarrow>=18.0.0`; generated `*.egg-info` metadata was removed afterwards.
 

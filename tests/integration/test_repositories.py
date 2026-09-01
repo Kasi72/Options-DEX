@@ -319,3 +319,143 @@ def test_raw_digest_collision_is_rejected_after_byte_comparison(
 
     with pytest.raises(RuntimeError, match="digest collision"):
         repository.save_raw(b'{"source":"second"}')
+
+
+def test_existing_schema_with_wrong_type_and_nullability_is_rejected_without_mutation(
+    tmp_path: Path,
+) -> None:
+    """Changing validation to accept nullable TEXT spot columns must fail here."""
+    database_path, parquet_root = _create_v1_database(tmp_path)
+    _rewrite_table_sql(
+        database_path,
+        "normalized_snapshots",
+        "spot FLOAT NOT NULL",
+        "spot TEXT",
+    )
+    before = database_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="unsupported existing database schema"):
+        SnapshotRepository(database_path=database_path, parquet_root=parquet_root)
+
+    assert database_path.read_bytes() == before
+
+
+def test_existing_schema_without_required_foreign_key_is_rejected_without_mutation(
+    tmp_path: Path,
+) -> None:
+    """Changing validation to accept unlinked normalized records must fail here."""
+    database_path, parquet_root = _create_v1_database(tmp_path)
+    _rewrite_table_sql(
+        database_path,
+        "normalized_snapshots",
+        "FOREIGN KEY(raw_snapshot_id) REFERENCES raw_snapshots (snapshot_id)",
+        "CHECK (1)",
+    )
+    before = database_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="unsupported existing database schema"):
+        SnapshotRepository(database_path=database_path, parquet_root=parquet_root)
+
+    assert database_path.read_bytes() == before
+
+
+def test_existing_schema_without_required_unique_index_is_rejected_without_mutation(
+    tmp_path: Path,
+) -> None:
+    """Changing validation to accept duplicate normalized identities must fail here."""
+    database_path, parquet_root = _create_v1_database(tmp_path)
+    _rewrite_table_sql(
+        database_path,
+        "normalized_snapshots",
+        "CONSTRAINT uq_normalized_snapshot_content UNIQUE (raw_snapshot_id, content_sha256)",
+        "CHECK (1)",
+        remove_unique_index=True,
+    )
+    before = database_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="unsupported existing database schema"):
+        SnapshotRepository(database_path=database_path, parquet_root=parquet_root)
+
+    assert database_path.read_bytes() == before
+
+
+def test_simultaneous_first_initialization_installs_one_valid_v1_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Changing post-lock initialization to trust a stale pristine check must fail here."""
+    database_path = tmp_path / "market.sqlite3"
+    parquet_root = tmp_path / "parquet"
+    original_exists = Path.exists
+    observed_missing = threading.Barrier(2)
+    start = threading.Barrier(3)
+    repositories: list[SnapshotRepository] = []
+    failures: list[Exception] = []
+
+    def synchronize_initial_exists(path: Path) -> bool:
+        result = original_exists(path)
+        if path == database_path:
+            observed_missing.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(Path, "exists", synchronize_initial_exists)
+
+    def initialize() -> None:
+        try:
+            start.wait(timeout=5)
+            repositories.append(
+                SnapshotRepository(database_path=database_path, parquet_root=parquet_root)
+            )
+        except Exception as error:  # noqa: BLE001 - asserted after concurrent construction.
+            failures.append(error)
+
+    workers = [threading.Thread(target=initialize) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    start.wait(timeout=5)
+    for worker in workers:
+        worker.join(timeout=10)
+    for repository in repositories:
+        repository.close()
+
+    assert not failures
+    assert len(repositories) == 2
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT version FROM schema_versions").fetchall() == [(1,)]
+
+
+def _create_v1_database(tmp_path: Path) -> tuple[Path, Path]:
+    database_path = tmp_path / "market.sqlite3"
+    parquet_root = tmp_path / "parquet"
+    with SnapshotRepository(database_path=database_path, parquet_root=parquet_root):
+        pass
+    return database_path, parquet_root
+
+
+def _rewrite_table_sql(
+    database_path: Path,
+    table_name: str,
+    expected_fragment: str,
+    replacement: str,
+    *,
+    remove_unique_index: bool = False,
+) -> None:
+    """Create an incompatible DB fixture without invoking application migration code."""
+    with sqlite3.connect(database_path) as connection:
+        table_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table_name,)
+        ).fetchone()
+        assert table_sql is not None
+        assert expected_fragment in table_sql[0]
+        connection.execute("PRAGMA writable_schema = ON")
+        connection.execute(
+            "UPDATE sqlite_master SET sql = ? WHERE type = 'table' AND name = ?",
+            (table_sql[0].replace(expected_fragment, replacement), table_name),
+        )
+        if remove_unique_index:
+            unique_indexes = connection.execute(f'PRAGMA index_list("{table_name}")').fetchall()
+            unique_index = next(index for index in unique_indexes if index[2] == 1 and index[3] == "u")
+            connection.execute("DELETE FROM sqlite_master WHERE type = 'index' AND name = ?", (unique_index[1],))
+        schema_version = connection.execute("PRAGMA schema_version").fetchone()
+        assert schema_version is not None
+        connection.execute(f"PRAGMA schema_version = {schema_version[0] + 1}")
+        connection.execute("PRAGMA writable_schema = OFF")

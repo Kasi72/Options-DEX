@@ -8,6 +8,7 @@ import zlib
 from collections.abc import Generator, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import date, datetime
+from functools import lru_cache
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Final, Literal, NewType, Self, cast
 from zoneinfo import ZoneInfo
@@ -32,6 +33,82 @@ from nifty_signal_engine.domain.market import OptionChainSnapshot, OptionQuote
 
 IST: Final = ZoneInfo("Asia/Kolkata")
 SnapshotId = NewType("SnapshotId", str)
+SchemaContract = tuple[tuple[str, tuple[object, ...], tuple[object, ...], tuple[object, ...]], ...]
+
+
+@lru_cache
+def _expected_v1_schema_contract() -> SchemaContract:
+    """Derive the v1 SQLite contract from the code-defined SQLAlchemy metadata."""
+    engine = create_engine("sqlite://")
+    try:
+        with engine.begin() as connection:
+            metadata.create_all(connection)
+            return _schema_contract(connection)
+    finally:
+        engine.dispose()
+
+
+def _schema_contract(connection: Connection) -> SchemaContract:
+    """Return stable SQLite PRAGMA metadata for all application tables."""
+    tables: list[tuple[str, tuple[object, ...], tuple[object, ...], tuple[object, ...]]] = []
+    table_names = sorted(metadata.tables)
+    for table_name in table_names:
+        columns = tuple(
+            (
+                cast(str, row[1]),
+                cast(str, row[2]).upper(),
+                int(row[3]),
+                int(row[5]),
+                None if row[4] is None else str(row[4]),
+            )
+            for row in connection.exec_driver_sql(f'PRAGMA table_info("{table_name}")')
+        )
+        indexes = tuple(
+            sorted(
+                (
+                    (
+                        cast(str, index[1]),
+                        int(index[2]),
+                        cast(str, index[3]),
+                        int(index[4]),
+                        tuple(
+                            (
+                                int(column[0]),
+                                int(column[1]),
+                                cast(str | None, column[2]),
+                            )
+                            for column in connection.exec_driver_sql(
+                                f'PRAGMA index_info("{cast(str, index[1])}")'
+                            )
+                        ),
+                    )
+                    for index in connection.exec_driver_sql(f'PRAGMA index_list("{table_name}")')
+                ),
+                key=repr,
+            )
+        )
+        foreign_keys = tuple(
+            sorted(
+                (
+                    (
+                        int(foreign_key[0]),
+                        int(foreign_key[1]),
+                        cast(str, foreign_key[2]),
+                        cast(str, foreign_key[3]),
+                        cast(str, foreign_key[4]),
+                        cast(str, foreign_key[5]),
+                        cast(str, foreign_key[6]),
+                        cast(str, foreign_key[7]),
+                    )
+                    for foreign_key in connection.exec_driver_sql(
+                        f'PRAGMA foreign_key_list("{table_name}")'
+                    )
+                ),
+                key=repr,
+            )
+        )
+        tables.append((table_name, columns, indexes, foreign_keys))
+    return tuple(tables)
 
 
 def _payload_digest(payload: bytes) -> str:
@@ -222,10 +299,14 @@ class SnapshotRepository:
             if str(journal_mode).lower() != "wal":
                 raise RuntimeError("SQLite WAL mode could not be enabled")
         with self._write_lock() as connection:
-            metadata.create_all(connection)
-            connection.execute(
-                insert(schema_versions).values(version=SCHEMA_VERSION, applied_at=schema_applied_at())
-            )
+            if self._user_table_names(connection):
+                self._assert_supported_existing_database(connection)
+            else:
+                metadata.create_all(connection)
+                connection.execute(
+                    insert(schema_versions).values(version=SCHEMA_VERSION, applied_at=schema_applied_at())
+                )
+                self._assert_supported_existing_database(connection)
             self._recover_orphaned_parquet_locked(connection)
 
     @contextmanager
@@ -243,14 +324,7 @@ class SnapshotRepository:
             connection.close()
 
     def _assert_supported_existing_database(self, connection: Connection) -> None:
-        expected_tables = set(metadata.tables)
-        actual_tables = {
-            cast(str, row[0])
-            for row in connection.exec_driver_sql(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-            )
-        }
-        if actual_tables != expected_tables:
+        if self._user_table_names(connection) != set(metadata.tables):
             raise RuntimeError("unsupported existing database schema")
         versions = list(connection.execute(select(schema_versions.c.version)).scalars())
         if versions != [SCHEMA_VERSION]:
@@ -258,13 +332,17 @@ class SnapshotRepository:
         journal_mode = connection.exec_driver_sql("PRAGMA journal_mode").scalar_one()
         if str(journal_mode).lower() != "wal":
             raise RuntimeError("unsupported existing database journal mode")
-        for table_name, table in metadata.tables.items():
-            columns = {
-                cast(str, row[1])
-                for row in connection.exec_driver_sql(f'PRAGMA table_info("{table_name}")')
-            }
-            if columns != set(table.columns.keys()):
-                raise RuntimeError("unsupported existing database schema")
+        if _schema_contract(connection) != _expected_v1_schema_contract():
+            raise RuntimeError("unsupported existing database schema")
+
+    @staticmethod
+    def _user_table_names(connection: Connection) -> set[str]:
+        return {
+            cast(str, row[0])
+            for row in connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
 
     def _recover_orphaned_parquet_locked(self, connection: Connection) -> None:
         """Remove only contained, unindexed files after obtaining the writer lock."""
