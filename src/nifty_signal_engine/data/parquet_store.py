@@ -8,6 +8,7 @@ import os
 from datetime import date
 from pathlib import Path
 from typing import Final
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import pyarrow as pa  # type: ignore[import-untyped]
@@ -78,9 +79,9 @@ class ParquetSnapshotStore:
         destination = self.root / relative_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists():
-            return relative_path
+            raise RuntimeError(f"immutable Parquet artifact already exists: {destination}")
 
-        temporary = destination.with_suffix(".parquet.tmp")
+        temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
         try:
             pq.write_table(self._table(raw_snapshot_id, canonical, session_date), temporary, compression="zstd")
             os.replace(temporary, destination)

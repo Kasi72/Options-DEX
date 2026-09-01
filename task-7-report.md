@@ -30,3 +30,19 @@ The plan’s prescribed SQLAlchemy 2 and PyArrow runtime dependencies were absen
 ## Concerns
 
 None.
+
+## Review correction round 1
+
+- Normalized publication, SQLite indexing, and orphan recovery now share a cross-process `BEGIN IMMEDIATE` writer-lock boundary. A startup cannot remove an artifact while its writer is paused after atomic publication and before index commit.
+- Parquet temporary names are writer-unique. Duplicate writers recheck the committed index while holding the lock; failure cleanup can remove only the current attempt's canonical publication.
+- Indexed paths are treated as hostile input: absolute, traversal, drive/root, symlink-root escape, and unexpected partition paths are rejected. Indexed instrument, session date, snapshot hash, and canonical partition are checked before replay.
+- SQLite enables foreign keys and full synchronous mode on every SQLAlchemy connection. Existing databases are read-only checked for the exact v1 schema/version/WAL contract before recovery; unknown, newer, or missing-version DBs are rejected without schema mutation.
+- Raw digest conflicts now decompress and byte-compare before accepting idempotence; a mismatched payload fails as a collision.
+
+### Correction-round evidence
+
+- RED: deterministic paused-after-publication startup, traversal, wrong-session, pooled-foreign-key, incompatible-schema, and digest-collision tests failed against commit `7d41d91`.
+- GREEN: `py -m pytest tests/integration/test_repositories.py -v` passed `16` tests.
+- `py -m ruff check src tests` — passed.
+- `py -m mypy src` — passed for 20 source files.
+- `py -m pytest tests/unit -v` — passed, 85 tests.

@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 import zlib
-from collections.abc import Iterator, Mapping
+from collections.abc import Generator, Iterator, Mapping
+from contextlib import contextmanager
 from datetime import date, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Final, Literal, NewType, Self, cast
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import create_engine, insert, select
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import Connection, create_engine, event, insert, select
 
 from nifty_signal_engine.data.parquet_store import (
     ParquetSnapshotStore,
@@ -34,17 +34,23 @@ IST: Final = ZoneInfo("Asia/Kolkata")
 SnapshotId = NewType("SnapshotId", str)
 
 
+def _payload_digest(payload: bytes) -> str:
+    """Return the content-address used for immutable raw snapshot identity."""
+    return hashlib.sha256(payload).hexdigest()
+
+
 class SnapshotRepository:
-    """Persist immutable bytes first, then normalized snapshots without live execution."""
+    """Persist immutable bytes first, then safely publish normalized snapshot indexes."""
 
     def __init__(self, *, database_path: Path, parquet_root: Path) -> None:
         self.database_path = database_path
         self.parquet_root = parquet_root
+        self._database_existed = database_path.exists()
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self._engine = create_engine(f"sqlite:///{database_path}", connect_args={"timeout": 30})
-        self._initialize()
+        event.listen(self._engine, "connect", self._configure_sqlite_connection)
         self._parquet = ParquetSnapshotStore(parquet_root)
-        self._recover_orphaned_parquet()
+        self._initialize_and_recover()
 
     def __enter__(self) -> Self:
         return self
@@ -57,20 +63,27 @@ class SnapshotRepository:
         self._engine.dispose()
 
     def save_raw(self, raw: bytes) -> SnapshotId:
-        """Content-address raw payload bytes and never mutate an existing row."""
+        """Content-address raw bytes, rejecting any digest collision instead of overwriting."""
         payload = bytes(raw)
-        snapshot_id = SnapshotId(hashlib.sha256(payload).hexdigest())
-        with self._engine.begin() as connection:
-            connection.execute(
-                sqlite_insert(raw_snapshots)
-                .values(
-                    snapshot_id=snapshot_id,
-                    sha256=snapshot_id,
-                    compressed_payload=zlib.compress(payload),
-                    saved_at=datetime.now(IST),
+        snapshot_id = SnapshotId(_payload_digest(payload))
+        with self._write_lock() as connection:
+            existing = connection.execute(
+                select(raw_snapshots.c.compressed_payload).where(
+                    raw_snapshots.c.snapshot_id == snapshot_id
                 )
-                .on_conflict_do_nothing(index_elements=[raw_snapshots.c.snapshot_id])
-            )
+            ).scalar_one_or_none()
+            if existing is None:
+                connection.execute(
+                    insert(raw_snapshots).values(
+                        snapshot_id=snapshot_id,
+                        sha256=snapshot_id,
+                        compressed_payload=zlib.compress(payload),
+                        saved_at=datetime.now(IST),
+                    )
+                )
+                return snapshot_id
+            if self._decompress_raw(snapshot_id, existing) != payload:
+                raise RuntimeError(f"raw snapshot digest collision for {snapshot_id}")
         return snapshot_id
 
     def read_raw(self, snapshot_id: SnapshotId) -> bytes:
@@ -83,28 +96,29 @@ class SnapshotRepository:
             ).scalar_one_or_none()
         if compressed_payload is None:
             raise KeyError(snapshot_id)
-        try:
-            payload = zlib.decompress(compressed_payload)
-        except zlib.error as error:
-            raise RuntimeError(f"raw snapshot {snapshot_id} is corrupt") from error
-        if hashlib.sha256(payload).hexdigest() != snapshot_id:
-            raise RuntimeError(f"raw snapshot {snapshot_id} failed integrity verification")
-        return payload
+        return self._decompress_raw(snapshot_id, compressed_payload)
 
     def save_normalized(self, snapshot_id: SnapshotId, snapshot: OptionChainSnapshot) -> None:
-        """Atomically publish full-strike Parquet before committing its SQLite index."""
+        """Publish Parquet and its SQLite index under one serialized writer boundary."""
         self.read_raw(snapshot_id)
         canonical = canonical_snapshot(snapshot)
         content_sha256 = snapshot_content_sha256(canonical)
-        existing = self._normalized_record(snapshot_id, content_sha256)
-        if existing is not None:
-            if not (self.parquet_root / existing.parquet_path).is_file():
-                raise RuntimeError("normalized snapshot index references a missing Parquet file")
-            return
+        expected_path = self._parquet._relative_path(
+            snapshot_id, canonical, canonical.source_timestamp.date()
+        )
 
-        relative_path = self._write_parquet_after_removing_orphan(snapshot_id, canonical)
-        try:
-            with self._engine.begin() as connection:
+        with self._write_lock() as connection:
+            existing = self._normalized_record(connection, snapshot_id, content_sha256)
+            if existing is not None:
+                self._verify_existing_publication(existing, snapshot_id, canonical, expected_path)
+                return
+
+            published = False
+            try:
+                relative_path = self._parquet.write(snapshot_id, canonical)
+                if relative_path != expected_path:
+                    raise RuntimeError("Parquet writer produced an unexpected partition path")
+                published = True
                 result = connection.execute(
                     insert(normalized_snapshots)
                     .values(
@@ -116,7 +130,7 @@ class SnapshotRepository:
                         received_at=canonical.received_at,
                         spot=canonical.spot,
                         expiry=canonical.expiry,
-                        parquet_path=str(relative_path).replace("\\", "/"),
+                        parquet_path=relative_path.as_posix(),
                     )
                     .returning(normalized_snapshots.c.id)
                 )
@@ -144,14 +158,10 @@ class SnapshotRepository:
                         for ordinal, quote in enumerate(canonical.quotes)
                     ],
                 )
-        except IntegrityError:
-            winner = self._normalized_record(snapshot_id, content_sha256)
-            if winner is not None and winner["parquet_path"] == str(relative_path).replace("\\", "/"):
-                return
-            raise
-        except Exception:
-            (self.parquet_root / relative_path).unlink(missing_ok=True)
-            raise
+            except Exception:
+                if published:
+                    self._remove_attempt_publication(expected_path)
+                raise
 
     def iter_session(
         self, instrument: str, session_date: date
@@ -173,79 +183,215 @@ class SnapshotRepository:
                 )
             ).mappings()
             for row in rows:
-                relative_path = Path(row["parquet_path"])
-                if not (self.parquet_root / relative_path).is_file():
-                    raise RuntimeError("normalized snapshot index references a missing Parquet file")
+                typed_row = cast(Mapping[str, Any], row)
                 quote_rows = connection.execute(
                     select(option_quotes)
-                    .where(option_quotes.c.normalized_snapshot_id == row["id"])
+                    .where(option_quotes.c.normalized_snapshot_id == typed_row["id"])
                     .order_by(option_quotes.c.ordinal)
                 ).mappings()
-                quotes = tuple(
-                    self._quote_from_row(cast(Mapping[str, Any], quote_row))
-                    for quote_row in quote_rows
+                snapshot = self._snapshot_from_rows(
+                    typed_row,
+                    (cast(Mapping[str, Any], quote_row) for quote_row in quote_rows),
                 )
-                snapshot = OptionChainSnapshot(
-                    instrument=row["instrument"],
-                    source_timestamp=self._as_ist(row["source_timestamp"]),
-                    received_at=self._as_ist(row["received_at"]),
-                    spot=row["spot"],
-                    expiry=row["expiry"],
-                    quotes=quotes,
-                )
-                self._parquet.verify(relative_path, row["raw_snapshot_id"], snapshot)
+                relative_path = self._validated_index_path(typed_row, snapshot)
+                self._parquet.verify(relative_path, cast(str, typed_row["raw_snapshot_id"]), snapshot)
                 yield snapshot
 
-    def _initialize(self) -> None:
-        with self._engine.begin() as connection:
-            connection.exec_driver_sql("PRAGMA journal_mode=WAL")
-            connection.exec_driver_sql("PRAGMA synchronous=FULL")
-            connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+    @staticmethod
+    def _configure_sqlite_connection(
+        dbapi_connection: sqlite3.Connection, _connection_record: object
+    ) -> None:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA synchronous=FULL")
+        finally:
+            cursor.close()
+
+    def _initialize_and_recover(self) -> None:
+        if self._database_existed:
+            with self._engine.connect() as connection:
+                self._assert_supported_existing_database(connection)
+            with self._write_lock() as connection:
+                self._assert_supported_existing_database(connection)
+                self._recover_orphaned_parquet_locked(connection)
+            return
+
+        with self._engine.connect() as connection:
+            journal_mode = connection.exec_driver_sql("PRAGMA journal_mode=WAL").scalar_one()
+            if str(journal_mode).lower() != "wal":
+                raise RuntimeError("SQLite WAL mode could not be enabled")
+        with self._write_lock() as connection:
             metadata.create_all(connection)
             connection.execute(
-                sqlite_insert(schema_versions)
-                .values(version=SCHEMA_VERSION, applied_at=schema_applied_at())
-                .on_conflict_do_nothing(index_elements=[schema_versions.c.version])
+                insert(schema_versions).values(version=SCHEMA_VERSION, applied_at=schema_applied_at())
             )
+            self._recover_orphaned_parquet_locked(connection)
 
-    def _recover_orphaned_parquet(self) -> None:
-        """Remove incomplete/unindexed writes so a restart never replays partial data."""
-        self.parquet_root.mkdir(parents=True, exist_ok=True)
-        with self._engine.connect() as connection:
-            known_paths = {
-                Path(path)
-                for path in connection.execute(select(normalized_snapshots.c.parquet_path)).scalars()
+    @contextmanager
+    def _write_lock(self) -> Generator[Connection, None, None]:
+        """Hold SQLite's cross-process writer lock over publication, indexing, and recovery."""
+        connection = self._engine.connect()
+        try:
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _assert_supported_existing_database(self, connection: Connection) -> None:
+        expected_tables = set(metadata.tables)
+        actual_tables = {
+            cast(str, row[0])
+            for row in connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        if actual_tables != expected_tables:
+            raise RuntimeError("unsupported existing database schema")
+        versions = list(connection.execute(select(schema_versions.c.version)).scalars())
+        if versions != [SCHEMA_VERSION]:
+            raise RuntimeError("unsupported existing database schema version")
+        journal_mode = connection.exec_driver_sql("PRAGMA journal_mode").scalar_one()
+        if str(journal_mode).lower() != "wal":
+            raise RuntimeError("unsupported existing database journal mode")
+        for table_name, table in metadata.tables.items():
+            columns = {
+                cast(str, row[1])
+                for row in connection.exec_driver_sql(f'PRAGMA table_info("{table_name}")')
             }
-        for temporary in self.parquet_root.rglob("*.tmp"):
-            temporary.unlink(missing_ok=True)
-        for parquet_file in self.parquet_root.rglob("*.parquet"):
-            if parquet_file.relative_to(self.parquet_root) not in known_paths:
-                parquet_file.unlink(missing_ok=True)
+            if columns != set(table.columns.keys()):
+                raise RuntimeError("unsupported existing database schema")
 
-    def _write_parquet_after_removing_orphan(
-        self, snapshot_id: SnapshotId, snapshot: OptionChainSnapshot
-    ) -> Path:
-        relative_path = self._parquet._relative_path(
-            snapshot_id, snapshot, snapshot.source_timestamp.date()
-        )
-        destination = self.parquet_root / relative_path
-        if destination.exists():
+    def _recover_orphaned_parquet_locked(self, connection: Connection) -> None:
+        """Remove only contained, unindexed files after obtaining the writer lock."""
+        self.parquet_root.mkdir(parents=True, exist_ok=True)
+        root = self.parquet_root.resolve()
+        known_paths: set[Path] = set()
+        for path_text in connection.execute(select(normalized_snapshots.c.parquet_path)).scalars():
             try:
-                self._parquet.verify(relative_path, snapshot_id, snapshot)
+                relative_path = self._safe_relative_path(cast(str, path_text))
             except RuntimeError:
-                destination.unlink()
-            else:
-                return relative_path
-        return self._parquet.write(snapshot_id, snapshot)
+                continue
+            known_paths.add(relative_path)
+        for candidate in self.parquet_root.rglob("*"):
+            if not candidate.is_file() or candidate.suffix not in {".parquet", ".tmp"}:
+                continue
+            try:
+                resolved = candidate.resolve(strict=False)
+                resolved.relative_to(root)
+                relative_path = candidate.relative_to(self.parquet_root)
+            except (OSError, ValueError):
+                continue
+            if candidate.suffix == ".tmp" or relative_path not in known_paths:
+                candidate.unlink(missing_ok=True)
 
-    def _normalized_record(self, snapshot_id: SnapshotId, content_sha256: str):
-        with self._engine.connect() as connection:
-            return connection.execute(
-                select(normalized_snapshots).where(
-                    normalized_snapshots.c.raw_snapshot_id == snapshot_id,
-                    normalized_snapshots.c.content_sha256 == content_sha256,
-                )
-            ).mappings().one_or_none()
+    def _verify_existing_publication(
+        self,
+        row: Mapping[str, Any],
+        snapshot_id: SnapshotId,
+        snapshot: OptionChainSnapshot,
+        expected_path: Path,
+    ) -> None:
+        if (
+            row["instrument"] != snapshot.instrument
+            or row["session_date"] != snapshot.source_timestamp.date()
+            or row["content_sha256"] != snapshot_content_sha256(snapshot)
+        ):
+            raise RuntimeError("normalized snapshot index is inconsistent")
+        actual_path = self._safe_relative_path(cast(str, row["parquet_path"]))
+        if actual_path != expected_path:
+            raise RuntimeError("normalized snapshot index is inconsistent")
+        self._parquet.verify(actual_path, snapshot_id, snapshot)
+
+    def _validated_index_path(self, row: Mapping[str, Any], snapshot: OptionChainSnapshot) -> Path:
+        try:
+            indexed_instrument = cast(str, row["instrument"])
+            indexed_date = cast(date, row["session_date"])
+            expected_path = self._parquet._relative_path(
+                cast(str, row["raw_snapshot_id"]), snapshot, snapshot.source_timestamp.date()
+            )
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("normalized snapshot index is inconsistent") from error
+        if (
+            indexed_instrument != snapshot.instrument
+            or indexed_date != snapshot.source_timestamp.date()
+            or row["content_sha256"] != snapshot_content_sha256(snapshot)
+        ):
+            raise RuntimeError("normalized snapshot index is inconsistent")
+        actual_path = self._safe_relative_path(cast(str, row["parquet_path"]))
+        if actual_path != expected_path:
+            raise RuntimeError("normalized snapshot index is inconsistent")
+        return actual_path
+
+    def _safe_relative_path(self, path_text: str) -> Path:
+        """Accept only a contained, non-traversing relative path beneath parquet_root."""
+        if not path_text:
+            raise RuntimeError("unsafe Parquet index path")
+        windows_path = PureWindowsPath(path_text)
+        posix_path = PurePosixPath(path_text)
+        if (
+            windows_path.is_absolute()
+            or windows_path.drive
+            or windows_path.root
+            or posix_path.is_absolute()
+            or any(part == ".." for part in windows_path.parts + posix_path.parts)
+        ):
+            raise RuntimeError("unsafe Parquet index path")
+        relative_path = Path(*posix_path.parts)
+        root = self.parquet_root.resolve()
+        try:
+            (root / relative_path).resolve(strict=False).relative_to(root)
+        except (OSError, ValueError) as error:
+            raise RuntimeError("unsafe Parquet index path") from error
+        return relative_path
+
+    def _remove_attempt_publication(self, relative_path: Path) -> None:
+        """Remove only this locked attempt's canonical destination after a failed index write."""
+        destination = self.parquet_root / relative_path
+        if self._safe_relative_path(relative_path.as_posix()) != relative_path:
+            raise RuntimeError("unsafe Parquet index path")
+        destination.unlink(missing_ok=True)
+
+    def _normalized_record(
+        self, connection: Connection, snapshot_id: SnapshotId, content_sha256: str
+    ) -> Mapping[str, Any] | None:
+        row = connection.execute(
+            select(normalized_snapshots).where(
+                normalized_snapshots.c.raw_snapshot_id == snapshot_id,
+                normalized_snapshots.c.content_sha256 == content_sha256,
+            )
+        ).mappings().one_or_none()
+        return cast(Mapping[str, Any] | None, row)
+
+    def _snapshot_from_rows(
+        self, row: Mapping[str, Any], quote_rows: Iterator[Mapping[str, Any]]
+    ) -> OptionChainSnapshot:
+        try:
+            quotes = tuple(self._quote_from_row(quote_row) for quote_row in quote_rows)
+            return OptionChainSnapshot(
+                instrument=cast(Literal["NIFTY", "BANKNIFTY"], row["instrument"]),
+                source_timestamp=self._as_ist(cast(datetime, row["source_timestamp"])),
+                received_at=self._as_ist(cast(datetime, row["received_at"])),
+                spot=cast(float, row["spot"]),
+                expiry=cast(date, row["expiry"]),
+                quotes=quotes,
+            )
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("normalized snapshot index is inconsistent") from error
+
+    @staticmethod
+    def _decompress_raw(snapshot_id: SnapshotId, compressed_payload: bytes) -> bytes:
+        try:
+            payload = zlib.decompress(compressed_payload)
+        except zlib.error as error:
+            raise RuntimeError(f"raw snapshot {snapshot_id} is corrupt") from error
+        if _payload_digest(payload) != snapshot_id:
+            raise RuntimeError(f"raw snapshot {snapshot_id} failed integrity verification")
+        return payload
 
     @staticmethod
     def _as_ist(value: datetime) -> datetime:
