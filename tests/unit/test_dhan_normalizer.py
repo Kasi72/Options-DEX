@@ -138,9 +138,29 @@ def test_normalizer_canonicalizes_aware_timestamps_to_india() -> None:
     assert getattr(snapshot.received_at.tzinfo, "key", None) == "Asia/Kolkata"
     assert snapshot.source_timestamp.isoformat() == "2026-08-30T10:00:00+05:30"
     assert snapshot.received_at.isoformat() == "2026-08-30T10:00:01+05:30"
-    assert {getattr(quote.timestamp.tzinfo, "key", None) for quote in snapshot.quotes} == {
-        "Asia/Kolkata"
-    }
+    assert {
+        getattr(quote.timestamp.tzinfo, "key", None) for quote in snapshot.quotes
+    } == {"Asia/Kolkata"}
     assert {quote.timestamp.isoformat() for quote in snapshot.quotes} == {
         "2026-08-30T10:00:00+05:30"
     }
+
+
+def test_normalizer_uses_broker_source_time_not_local_http_receipt() -> None:
+    """Replacing exchange time with the local receipt must fail this provenance contract."""
+    payload = json.loads((FIXTURES / "dhan_option_chain.json").read_text())
+    payload["data"]["timestamp"] = "2026-08-30T09:59:58+05:30"
+    raw = RawSnapshot(
+        body=json.dumps(payload).encode(),
+        captured_at=datetime(2026, 8, 30, 10, 0, 1, tzinfo=IST),
+        expiry=date(2026, 9, 1),
+    )
+
+    snapshot = normalize_option_chain(
+        raw, "NIFTY", datetime(2026, 8, 30, 10, 0, 2, tzinfo=IST)
+    )
+
+    assert snapshot.source_time_authoritative is True
+    assert snapshot.source_timestamp.isoformat() == "2026-08-30T09:59:58+05:30"
+    assert snapshot.received_at.isoformat() == "2026-08-30T10:00:02+05:30"
+    assert {quote.timestamp for quote in snapshot.quotes} == {snapshot.source_timestamp}

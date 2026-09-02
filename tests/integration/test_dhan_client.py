@@ -22,7 +22,10 @@ ROOT = Path(__file__).parents[2]
 def test_project_declares_httpx_runtime_dependency() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
 
-    assert any(dependency.startswith("httpx>=") for dependency in project["project"]["dependencies"])
+    assert any(
+        dependency.startswith("httpx>=")
+        for dependency in project["project"]["dependencies"]
+    )
 
 
 def test_fetch_expiries_uses_exchange_metadata_and_correct_nifty_request() -> None:
@@ -45,6 +48,7 @@ def test_fetch_expiries_uses_exchange_metadata_and_correct_nifty_request() -> No
         client_id="test-client",
         transport=httpx.MockTransport(handler),
         timeout=2.5,
+        clock=lambda: datetime(2026, 8, 30, 10, 0, tzinfo=IST),
     )
 
     expiries = asyncio.run(client.fetch_expiries("NIFTY"))
@@ -52,8 +56,28 @@ def test_fetch_expiries_uses_exchange_metadata_and_correct_nifty_request() -> No
     assert expiries == (date(2026, 9, 1), date(2026, 9, 8), date(2026, 9, 29))
 
 
+def test_expiry_discovery_sorts_and_filters_already_expired_dates() -> None:
+    """Selecting the broker's original list order must not choose an expired contract."""
+    client = DhanClient(
+        access_token="test-token",
+        client_id="test-client",
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200, json={"data": ["2026-09-08", "2026-08-25", "2026-09-01"]}
+            )
+        ),
+        clock=lambda: datetime(2026, 8, 30, 10, 0, tzinfo=IST),
+    )
+
+    expiries = asyncio.run(client.fetch_expiries("NIFTY"))
+
+    assert expiries == (date(2026, 9, 1), date(2026, 9, 8))
+
+
 def test_fetch_option_chain_uses_banknifty_identifier_and_expiry() -> None:
-    body = (FIXTURES / "dhan_option_chain.json").read_bytes()
+    payload = json.loads((FIXTURES / "dhan_option_chain.json").read_text())
+    payload["data"]["timestamp"] = "2026-08-30T09:59:58+05:30"
+    body = json.dumps(payload).encode()
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url == "https://api.dhan.co/v2/optionchain"
@@ -75,6 +99,34 @@ def test_fetch_option_chain_uses_banknifty_identifier_and_expiry() -> None:
 
     assert raw.body == body
     assert raw.captured_at.tzinfo is not None
+    assert raw.source_time_authoritative is True
+    assert raw.broker_source_timestamp is not None
+    assert raw.broker_source_timestamp.isoformat() == "2026-08-30T09:59:58+05:30"
+
+
+def test_http_error_retains_response_bytes_and_receipt_metadata_without_headers() -> (
+    None
+):
+    """Discarding a failed broker body must not prevent raw forensic persistence."""
+    receipt = datetime(2026, 8, 30, 10, 0, tzinfo=IST)
+    client = DhanClient(
+        access_token="test-token",
+        client_id="test-client",
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(503, content=b'{"error":"busy"}')
+        ),
+        clock=lambda: receipt,
+    )
+
+    with pytest.raises(BrokerHTTPError) as raised:
+        asyncio.run(client.fetch_option_chain("NIFTY", date(2026, 9, 1)))
+
+    error = raised.value
+    assert error.status_code == 503
+    assert error.body == b'{"error":"busy"}'
+    assert error.received_at == receipt
+    assert error.transient is True
+    assert "test-token" not in str(error)
 
 
 @pytest.mark.parametrize(

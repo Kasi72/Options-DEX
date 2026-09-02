@@ -35,6 +35,7 @@ class OptionChainSnapshot(BaseModel, frozen=True):
     spot: float
     expiry: date
     quotes: tuple[OptionQuote, ...]
+    source_time_authoritative: bool = False
 
     @model_validator(mode="after")
     def validate_timestamps(self) -> Self:

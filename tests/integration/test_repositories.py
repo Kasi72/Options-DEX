@@ -12,12 +12,15 @@ import pytest
 
 from nifty_signal_engine.data.repositories import SnapshotRepository
 from nifty_signal_engine.domain.market import OptionChainSnapshot
+from nifty_signal_engine.monitoring.data_quality import DataQualityReport
 from tests.factories import make_chain
 
 
 @pytest.fixture
 def repository(tmp_path: Path) -> SnapshotRepository:
-    return SnapshotRepository(database_path=tmp_path / "market.sqlite3", parquet_root=tmp_path / "parquet")
+    return SnapshotRepository(
+        database_path=tmp_path / "market.sqlite3", parquet_root=tmp_path / "parquet"
+    )
 
 
 @pytest.fixture
@@ -36,14 +39,16 @@ def test_raw_snapshot_is_content_addressed_and_immutable(
     assert repository.read_raw(first) == raw_payload
 
 
-def test_schema_uses_wal_and_records_current_version(repository: SnapshotRepository) -> None:
+def test_schema_uses_wal_and_records_current_version(
+    repository: SnapshotRepository,
+) -> None:
     """Changing setup away from recoverable WAL or unversioned schema must fail here."""
     with sqlite3.connect(repository.database_path) as connection:
         journal_mode = connection.execute("PRAGMA journal_mode").fetchone()
         versions = connection.execute("SELECT version FROM schema_versions").fetchall()
 
     assert journal_mode == ("wal",)
-    assert versions == [(1,)]
+    assert versions == [(2,)]
 
 
 def test_sqlite_timestamps_preserve_the_required_ist_offset(
@@ -70,12 +75,16 @@ def test_normalized_snapshot_is_read_in_chronological_order_after_reopen(
     later = make_chain(timestamp="2026-08-28T09:16:00+05:30")
     earlier = make_chain(timestamp="2026-08-28T09:15:00+05:30")
 
-    with SnapshotRepository(database_path=database_path, parquet_root=parquet_root) as repository:
+    with SnapshotRepository(
+        database_path=database_path, parquet_root=parquet_root
+    ) as repository:
         raw_id = repository.save_raw(raw_payload)
         repository.save_normalized(raw_id, later)
         repository.save_normalized(raw_id, earlier)
 
-    with SnapshotRepository(database_path=database_path, parquet_root=parquet_root) as repository:
+    with SnapshotRepository(
+        database_path=database_path, parquet_root=parquet_root
+    ) as repository:
         snapshots = list(repository.iter_session("NIFTY", date(2026, 8, 28)))
 
     assert [snapshot.source_timestamp for snapshot in snapshots] == [
@@ -133,7 +142,10 @@ def test_concurrent_duplicate_normalized_write_keeps_one_replayable_artifact(
         except Exception as error:  # noqa: BLE001 - assertion below inspects worker failures.
             failures.append(error)
 
-    workers = [threading.Thread(target=save, args=(repository,)) for repository in (first, second)]
+    workers = [
+        threading.Thread(target=save, args=(repository,))
+        for repository in (first, second)
+    ]
     for worker in workers:
         worker.start()
     barrier.wait(timeout=5)
@@ -175,7 +187,9 @@ def test_startup_recovery_waits_for_a_writer_that_has_published_but_not_indexed(
 
     def reopen() -> None:
         try:
-            with SnapshotRepository(database_path=database_path, parquet_root=parquet_root):
+            with SnapshotRepository(
+                database_path=database_path, parquet_root=parquet_root
+            ):
                 startup_finished.set()
         except Exception as error:  # noqa: BLE001 - asserted after joining worker.
             failures.append(error)
@@ -204,7 +218,9 @@ def test_replay_rejects_an_index_path_that_escapes_the_parquet_root(
     external_copy = tmp_path / "outside.parquet"
     copyfile(next(repository.parquet_root.rglob("*.parquet")), external_copy)
     with sqlite3.connect(repository.database_path) as connection:
-        connection.execute("UPDATE normalized_snapshots SET parquet_path = '../outside.parquet'")
+        connection.execute(
+            "UPDATE normalized_snapshots SET parquet_path = '../outside.parquet'"
+        )
         connection.commit()
 
     with pytest.raises(RuntimeError, match="unsafe Parquet index path"):
@@ -223,7 +239,9 @@ def test_recovery_never_deletes_a_database_referenced_path_outside_its_root(
     external_file = tmp_path / "must-not-delete.parquet"
     external_file.write_bytes(b"protected")
     with sqlite3.connect(repository.database_path) as connection:
-        connection.execute("UPDATE normalized_snapshots SET parquet_path = '../must-not-delete.parquet'")
+        connection.execute(
+            "UPDATE normalized_snapshots SET parquet_path = '../must-not-delete.parquet'"
+        )
         connection.commit()
 
     with SnapshotRepository(
@@ -242,14 +260,18 @@ def test_replay_rejects_indexed_session_that_disagrees_with_source_timestamp(
     raw_id = repository.save_raw(raw_payload)
     repository.save_normalized(raw_id, snapshot)
     with sqlite3.connect(repository.database_path) as connection:
-        connection.execute("UPDATE normalized_snapshots SET session_date = '2026-08-29'")
+        connection.execute(
+            "UPDATE normalized_snapshots SET session_date = '2026-08-29'"
+        )
         connection.commit()
 
     with pytest.raises(RuntimeError, match="normalized snapshot index is inconsistent"):
         list(repository.iter_session("NIFTY", date(2026, 8, 29)))
 
 
-def test_foreign_keys_are_enabled_on_every_pooled_connection(repository: SnapshotRepository) -> None:
+def test_foreign_keys_are_enabled_on_every_pooled_connection(
+    repository: SnapshotRepository,
+) -> None:
     """Changing connection setup to configure only the bootstrap handle must fail here."""
     with repository._engine.connect() as first, repository._engine.connect() as second:
         first_foreign_keys = first.exec_driver_sql("PRAGMA foreign_keys").scalar_one()
@@ -259,7 +281,9 @@ def test_foreign_keys_are_enabled_on_every_pooled_connection(repository: Snapsho
     assert second_foreign_keys == 1
 
 
-def test_existing_unversioned_database_is_rejected_without_mutation(tmp_path: Path) -> None:
+def test_existing_unversioned_database_is_rejected_without_mutation(
+    tmp_path: Path,
+) -> None:
     """Changing startup to create tables in an unknown database must fail here."""
     database_path = tmp_path / "market.sqlite3"
     with sqlite3.connect(database_path) as connection:
@@ -267,12 +291,16 @@ def test_existing_unversioned_database_is_rejected_without_mutation(tmp_path: Pa
     before = database_path.read_bytes()
 
     with pytest.raises(RuntimeError, match="unsupported existing database"):
-        SnapshotRepository(database_path=database_path, parquet_root=tmp_path / "parquet")
+        SnapshotRepository(
+            database_path=database_path, parquet_root=tmp_path / "parquet"
+        )
 
     assert database_path.read_bytes() == before
 
 
-def test_existing_newer_schema_version_is_rejected_without_mutation(tmp_path: Path) -> None:
+def test_existing_newer_schema_version_is_rejected_without_mutation(
+    tmp_path: Path,
+) -> None:
     """Changing startup to accept an unknown newer schema must fail here."""
     database_path = tmp_path / "market.sqlite3"
     parquet_root = tmp_path / "parquet"
@@ -314,7 +342,9 @@ def test_raw_digest_collision_is_rejected_after_byte_comparison(
     repository: SnapshotRepository, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Changing raw upsert to accept a digest collision must fail here."""
-    monkeypatch.setattr("nifty_signal_engine.data.repositories._payload_digest", lambda _raw: "a" * 64)
+    monkeypatch.setattr(
+        "nifty_signal_engine.data.repositories._payload_digest", lambda _raw: "a" * 64
+    )
     repository.save_raw(b'{"source":"first"}')
 
     with pytest.raises(RuntimeError, match="digest collision"):
@@ -379,7 +409,7 @@ def test_existing_schema_without_required_unique_index_is_rejected_without_mutat
     assert database_path.read_bytes() == before
 
 
-def test_simultaneous_first_initialization_installs_one_valid_v1_schema(
+def test_simultaneous_first_initialization_installs_one_valid_v2_schema(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Changing post-lock initialization to trust a stale pristine check must fail here."""
@@ -403,7 +433,9 @@ def test_simultaneous_first_initialization_installs_one_valid_v1_schema(
         try:
             start.wait(timeout=5)
             repositories.append(
-                SnapshotRepository(database_path=database_path, parquet_root=parquet_root)
+                SnapshotRepository(
+                    database_path=database_path, parquet_root=parquet_root
+                )
             )
         except Exception as error:  # noqa: BLE001 - asserted after concurrent construction.
             failures.append(error)
@@ -420,7 +452,77 @@ def test_simultaneous_first_initialization_installs_one_valid_v1_schema(
     assert not failures
     assert len(repositories) == 2
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("SELECT version FROM schema_versions").fetchall() == [(1,)]
+        assert connection.execute("SELECT version FROM schema_versions").fetchall() == [
+            (2,)
+        ]
+
+
+def test_quality_decision_and_collector_baseline_survive_repository_restart(
+    tmp_path: Path, raw_payload: bytes
+) -> None:
+    """Dropping audit/state writes must not make a restart silently baseline from nothing."""
+    database_path = tmp_path / "market.sqlite3"
+    parquet_root = tmp_path / "parquet"
+    snapshot = make_chain(
+        timestamp="2026-08-28T10:00:00+05:30", call_volume=10, put_volume=10
+    )
+    report = DataQualityReport(
+        tradable=False,
+        codes=(),
+        checked_at=snapshot.received_at,
+        details={"baseline": "no_persisted_baseline"},
+    )
+    with SnapshotRepository(
+        database_path=database_path, parquet_root=parquet_root
+    ) as repository:
+        raw_id = repository.save_raw(raw_payload)
+        repository.save_normalized(raw_id, snapshot)
+        repository.record_quality_and_baseline(raw_id, snapshot, report, baseline=True)
+
+    with SnapshotRepository(
+        database_path=database_path, parquet_root=parquet_root
+    ) as repository:
+        restored = repository.load_collector_baseline("NIFTY")
+        summary = repository.session_quality_summary("NIFTY", date(2026, 8, 28))
+
+    assert restored == snapshot
+    assert summary == {"snapshot_count": 1, "tradable_count": 0, "codes": {}}
+
+
+def test_exact_v1_database_is_migrated_to_v2_under_the_writer_lock(
+    tmp_path: Path,
+) -> None:
+    """Rejecting an otherwise exact v1 store must not strand prior immutable snapshots."""
+    database_path = tmp_path / "market.sqlite3"
+    parquet_root = tmp_path / "parquet"
+    with SnapshotRepository(database_path=database_path, parquet_root=parquet_root):
+        pass
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP TABLE quality_decisions")
+        connection.execute(
+            "ALTER TABLE normalized_snapshots DROP COLUMN source_time_authoritative"
+        )
+        connection.execute("DELETE FROM schema_versions")
+        connection.execute(
+            "INSERT INTO schema_versions (version, applied_at) VALUES (1, '2026-08-28T09:15:00+05:30')"
+        )
+        connection.commit()
+
+    with SnapshotRepository(database_path=database_path, parquet_root=parquet_root):
+        pass
+
+    with sqlite3.connect(database_path) as connection:
+        versions = connection.execute("SELECT version FROM schema_versions").fetchall()
+        columns = connection.execute(
+            "PRAGMA table_info(normalized_snapshots)"
+        ).fetchall()
+        quality_table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'quality_decisions'"
+        ).fetchone()
+
+    assert versions == [(2,)]
+    assert any(column[1] == "source_time_authoritative" for column in columns)
+    assert quality_table == ("quality_decisions",)
 
 
 def _create_v1_database(tmp_path: Path) -> tuple[Path, Path]:
@@ -442,7 +544,8 @@ def _rewrite_table_sql(
     """Create an incompatible DB fixture without invoking application migration code."""
     with sqlite3.connect(database_path) as connection:
         table_sql = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table_name,)
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
         ).fetchone()
         assert table_sql is not None
         assert expected_fragment in table_sql[0]
@@ -452,9 +555,16 @@ def _rewrite_table_sql(
             (table_sql[0].replace(expected_fragment, replacement), table_name),
         )
         if remove_unique_index:
-            unique_indexes = connection.execute(f'PRAGMA index_list("{table_name}")').fetchall()
-            unique_index = next(index for index in unique_indexes if index[2] == 1 and index[3] == "u")
-            connection.execute("DELETE FROM sqlite_master WHERE type = 'index' AND name = ?", (unique_index[1],))
+            unique_indexes = connection.execute(
+                f'PRAGMA index_list("{table_name}")'
+            ).fetchall()
+            unique_index = next(
+                index for index in unique_indexes if index[2] == 1 and index[3] == "u"
+            )
+            connection.execute(
+                "DELETE FROM sqlite_master WHERE type = 'index' AND name = ?",
+                (unique_index[1],),
+            )
         schema_version = connection.execute("PRAGMA schema_version").fetchone()
         assert schema_version is not None
         connection.execute(f"PRAGMA schema_version = {schema_version[0] + 1}")

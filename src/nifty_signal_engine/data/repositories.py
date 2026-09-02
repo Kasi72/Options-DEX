@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import zlib
-from collections.abc import Generator, Iterator, Mapping
+from collections.abc import Generator, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import date, datetime
 from functools import lru_cache
@@ -13,7 +13,15 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Final, Literal, NewType, Self, cast
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Connection, create_engine, event, insert, select
+from sqlalchemy import (
+    Connection,
+    MetaData,
+    create_engine,
+    delete,
+    event,
+    insert,
+    select,
+)
 
 from nifty_signal_engine.data.parquet_store import (
     ParquetSnapshotStore,
@@ -25,34 +33,92 @@ from nifty_signal_engine.data.schema import (
     metadata,
     normalized_snapshots,
     option_quotes,
+    quality_decisions,
     raw_snapshots,
     schema_applied_at,
     schema_versions,
 )
 from nifty_signal_engine.domain.market import OptionChainSnapshot, OptionQuote
+from nifty_signal_engine.monitoring.data_quality import DataQualityReport
 
 IST: Final = ZoneInfo("Asia/Kolkata")
 SnapshotId = NewType("SnapshotId", str)
-SchemaContract = tuple[tuple[str, tuple[object, ...], tuple[object, ...], tuple[object, ...]], ...]
+SchemaContract = tuple[
+    tuple[str, tuple[object, ...], tuple[object, ...], tuple[object, ...]], ...
+]
+
+
+@lru_cache
+def _expected_v2_schema_contract() -> SchemaContract:
+    """Derive the current SQLite contract from the code-defined metadata."""
+    return _expected_schema_contract(metadata)
 
 
 @lru_cache
 def _expected_v1_schema_contract() -> SchemaContract:
-    """Derive the v1 SQLite contract from the code-defined SQLAlchemy metadata."""
+    """Reconstruct the exact supported v1 schema before its locked migration."""
+    legacy_tables: list[
+        tuple[str, tuple[object, ...], tuple[object, ...], tuple[object, ...]]
+    ] = []
+    for table_name, columns, indexes, foreign_keys in _expected_v2_schema_contract():
+        if table_name == "quality_decisions":
+            continue
+        if table_name == "normalized_snapshots":
+            columns = tuple(
+                column
+                for column in columns
+                if cast(tuple[object, ...], column)[0] != "source_time_authoritative"
+            )
+        legacy_tables.append((table_name, columns, indexes, foreign_keys))
+    return tuple(legacy_tables)
+
+
+@lru_cache
+def _expected_migrated_v2_schema_contract() -> SchemaContract:
+    """Accept the one deterministic SQLite layout produced by the locked v1 upgrade."""
+    migrated: list[
+        tuple[str, tuple[object, ...], tuple[object, ...], tuple[object, ...]]
+    ] = []
+    for table_name, columns, indexes, foreign_keys in _expected_v2_schema_contract():
+        if table_name == "normalized_snapshots":
+            source_column = next(
+                cast(tuple[object, ...], column)
+                for column in columns
+                if cast(tuple[object, ...], column)[0] == "source_time_authoritative"
+            )
+            source_column = (*cast(tuple[object, ...], source_column)[:-1], "0")
+            columns = tuple(
+                column
+                for column in columns
+                if cast(tuple[object, ...], column)[0] != "source_time_authoritative"
+            ) + (source_column,)
+        migrated.append((table_name, columns, indexes, foreign_keys))
+    return tuple(migrated)
+
+
+def _expected_schema_contract(schema: MetaData) -> SchemaContract:
+    """Materialize an expected contract in a private in-memory SQLite database."""
     engine = create_engine("sqlite://")
     try:
         with engine.begin() as connection:
-            metadata.create_all(connection)
-            return _schema_contract(connection)
+            schema.create_all(connection)
+            return _schema_contract(connection, schema)
     finally:
         engine.dispose()
 
 
-def _schema_contract(connection: Connection) -> SchemaContract:
+def _schema_contract(
+    connection: Connection,
+    schema: MetaData = metadata,
+    *,
+    table_names: Iterable[str] | None = None,
+) -> SchemaContract:
     """Return stable SQLite PRAGMA metadata for all application tables."""
-    tables: list[tuple[str, tuple[object, ...], tuple[object, ...], tuple[object, ...]]] = []
-    table_names = sorted(metadata.tables)
-    for table_name in table_names:
+    tables: list[
+        tuple[str, tuple[object, ...], tuple[object, ...], tuple[object, ...]]
+    ] = []
+    names = sorted(schema.tables if table_names is None else table_names)
+    for table_name in names:
         columns = tuple(
             (
                 cast(str, row[1]),
@@ -82,7 +148,9 @@ def _schema_contract(connection: Connection) -> SchemaContract:
                             )
                         ),
                     )
-                    for index in connection.exec_driver_sql(f'PRAGMA index_list("{table_name}")')
+                    for index in connection.exec_driver_sql(
+                        f'PRAGMA index_list("{table_name}")'
+                    )
                 ),
                 key=repr,
             )
@@ -124,7 +192,9 @@ class SnapshotRepository:
         self.parquet_root = parquet_root
         self._database_existed = database_path.exists()
         database_path.parent.mkdir(parents=True, exist_ok=True)
-        self._engine = create_engine(f"sqlite:///{database_path}", connect_args={"timeout": 30})
+        self._engine = create_engine(
+            f"sqlite:///{database_path}", connect_args={"timeout": 30}
+        )
         event.listen(self._engine, "connect", self._configure_sqlite_connection)
         self._parquet = ParquetSnapshotStore(parquet_root)
         self._initialize_and_recover()
@@ -132,7 +202,9 @@ class SnapshotRepository:
     def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, _exc_type: object, _exc_value: object, _traceback: object) -> None:
+    def __exit__(
+        self, _exc_type: object, _exc_value: object, _traceback: object
+    ) -> None:
         self.close()
 
     def close(self) -> None:
@@ -175,7 +247,9 @@ class SnapshotRepository:
             raise KeyError(snapshot_id)
         return self._decompress_raw(snapshot_id, compressed_payload)
 
-    def save_normalized(self, snapshot_id: SnapshotId, snapshot: OptionChainSnapshot) -> None:
+    def save_normalized(
+        self, snapshot_id: SnapshotId, snapshot: OptionChainSnapshot
+    ) -> None:
         """Publish Parquet and its SQLite index under one serialized writer boundary."""
         self.read_raw(snapshot_id)
         canonical = canonical_snapshot(snapshot)
@@ -187,14 +261,18 @@ class SnapshotRepository:
         with self._write_lock() as connection:
             existing = self._normalized_record(connection, snapshot_id, content_sha256)
             if existing is not None:
-                self._verify_existing_publication(existing, snapshot_id, canonical, expected_path)
+                self._verify_existing_publication(
+                    existing, snapshot_id, canonical, expected_path
+                )
                 return
 
             published = False
             try:
                 relative_path = self._parquet.write(snapshot_id, canonical)
                 if relative_path != expected_path:
-                    raise RuntimeError("Parquet writer produced an unexpected partition path")
+                    raise RuntimeError(
+                        "Parquet writer produced an unexpected partition path"
+                    )
                 published = True
                 result = connection.execute(
                     insert(normalized_snapshots)
@@ -207,6 +285,7 @@ class SnapshotRepository:
                         received_at=canonical.received_at,
                         spot=canonical.spot,
                         expiry=canonical.expiry,
+                        source_time_authoritative=canonical.source_time_authoritative,
                         parquet_path=relative_path.as_posix(),
                     )
                     .returning(normalized_snapshots.c.id)
@@ -271,8 +350,122 @@ class SnapshotRepository:
                     (cast(Mapping[str, Any], quote_row) for quote_row in quote_rows),
                 )
                 relative_path = self._validated_index_path(typed_row, snapshot)
-                self._parquet.verify(relative_path, cast(str, typed_row["raw_snapshot_id"]), snapshot)
+                self._parquet.verify(
+                    relative_path, cast(str, typed_row["raw_snapshot_id"]), snapshot
+                )
                 yield snapshot
+
+    def record_quality_and_baseline(
+        self,
+        snapshot_id: SnapshotId,
+        snapshot: OptionChainSnapshot,
+        report: DataQualityReport,
+        *,
+        baseline: bool,
+    ) -> None:
+        """Append an auditable decision and atomically update one instrument baseline."""
+        canonical = canonical_snapshot(snapshot)
+        content_sha256 = snapshot_content_sha256(canonical)
+        with self._write_lock() as connection:
+            record = self._normalized_record(connection, snapshot_id, content_sha256)
+            if record is None:
+                raise RuntimeError("quality requires a persisted normalized snapshot")
+            normalized_id = cast(int, record["id"])
+            connection.execute(
+                insert(quality_decisions).values(
+                    normalized_snapshot_id=normalized_id,
+                    tradable=report.tradable,
+                    codes=[str(code) for code in report.codes],
+                    details=report.details,
+                    checked_at=report.checked_at,
+                )
+            )
+            if baseline:
+                connection.execute(
+                    delete(metadata.tables["collector_state"]).where(
+                        metadata.tables["collector_state"].c.instrument
+                        == snapshot.instrument
+                    )
+                )
+                connection.execute(
+                    insert(metadata.tables["collector_state"]).values(
+                        instrument=snapshot.instrument,
+                        state={"normalized_snapshot_id": normalized_id},
+                        updated_at=report.checked_at,
+                    )
+                )
+
+    def load_collector_baseline(self, instrument: str) -> OptionChainSnapshot | None:
+        """Restore the last persisted in-order baseline for exactly one instrument."""
+        if instrument not in {"NIFTY", "BANKNIFTY"}:
+            raise ValueError(f"unsupported instrument: {instrument}")
+        state_table = metadata.tables["collector_state"]
+        with self._engine.connect() as connection:
+            state = connection.execute(
+                select(state_table.c.state).where(
+                    state_table.c.instrument == instrument
+                )
+            ).scalar_one_or_none()
+            if not isinstance(state, dict) or not isinstance(
+                state.get("normalized_snapshot_id"), int
+            ):
+                return None
+            record = (
+                connection.execute(
+                    select(normalized_snapshots).where(
+                        normalized_snapshots.c.id == state["normalized_snapshot_id"]
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if record is None:
+                raise RuntimeError(
+                    "collector state references a missing normalized snapshot"
+                )
+            row = cast(Mapping[str, Any], record)
+            quotes = connection.execute(
+                select(option_quotes)
+                .where(option_quotes.c.normalized_snapshot_id == row["id"])
+                .order_by(option_quotes.c.ordinal)
+            ).mappings()
+            return self._snapshot_from_rows(
+                row, (cast(Mapping[str, Any], quote) for quote in quotes)
+            )
+
+    def session_quality_summary(
+        self, instrument: str, selected_date: date
+    ) -> dict[str, object]:
+        """Return audit counts for inspection without exposing raw payloads or credentials."""
+        with self._engine.connect() as connection:
+            snapshot_ids = list(
+                connection.execute(
+                    select(normalized_snapshots.c.id).where(
+                        normalized_snapshots.c.instrument == instrument,
+                        normalized_snapshots.c.session_date == selected_date,
+                    )
+                ).scalars()
+            )
+            if not snapshot_ids:
+                return {"snapshot_count": 0, "tradable_count": 0, "codes": {}}
+            decisions = connection.execute(
+                select(quality_decisions.c.tradable, quality_decisions.c.codes).where(
+                    quality_decisions.c.normalized_snapshot_id.in_(snapshot_ids)
+                )
+            )
+            tradable_count = 0
+            codes: dict[str, int] = {}
+            for tradable, recorded_codes in decisions:
+                tradable_count += int(bool(tradable))
+                if isinstance(recorded_codes, list):
+                    for code in recorded_codes:
+                        if isinstance(code, str):
+                            codes[code] = codes.get(code, 0) + 1
+        return {
+            "snapshot_count": len(snapshot_ids),
+            "tradable_count": tradable_count,
+            "codes": codes,
+        }
 
     @staticmethod
     def _configure_sqlite_connection(
@@ -287,24 +480,28 @@ class SnapshotRepository:
 
     def _initialize_and_recover(self) -> None:
         if self._database_existed:
-            with self._engine.connect() as connection:
-                self._assert_supported_existing_database(connection)
             with self._write_lock() as connection:
+                self._migrate_v1_if_needed(connection)
                 self._assert_supported_existing_database(connection)
                 self._recover_orphaned_parquet_locked(connection)
             return
 
         with self._engine.connect() as connection:
-            journal_mode = connection.exec_driver_sql("PRAGMA journal_mode=WAL").scalar_one()
+            journal_mode = connection.exec_driver_sql(
+                "PRAGMA journal_mode=WAL"
+            ).scalar_one()
             if str(journal_mode).lower() != "wal":
                 raise RuntimeError("SQLite WAL mode could not be enabled")
         with self._write_lock() as connection:
             if self._user_table_names(connection):
+                self._migrate_v1_if_needed(connection)
                 self._assert_supported_existing_database(connection)
             else:
                 metadata.create_all(connection)
                 connection.execute(
-                    insert(schema_versions).values(version=SCHEMA_VERSION, applied_at=schema_applied_at())
+                    insert(schema_versions).values(
+                        version=SCHEMA_VERSION, applied_at=schema_applied_at()
+                    )
                 )
                 self._assert_supported_existing_database(connection)
             self._recover_orphaned_parquet_locked(connection)
@@ -332,8 +529,35 @@ class SnapshotRepository:
         journal_mode = connection.exec_driver_sql("PRAGMA journal_mode").scalar_one()
         if str(journal_mode).lower() != "wal":
             raise RuntimeError("unsupported existing database journal mode")
-        if _schema_contract(connection) != _expected_v1_schema_contract():
+        if _schema_contract(connection) not in {
+            _expected_v2_schema_contract(),
+            _expected_migrated_v2_schema_contract(),
+        }:
             raise RuntimeError("unsupported existing database schema")
+
+    def _migrate_v1_if_needed(self, connection: Connection) -> None:
+        """Upgrade only the exact known v1 contract inside the existing writer lock."""
+        if "schema_versions" not in self._user_table_names(connection):
+            return
+        versions = list(connection.execute(select(schema_versions.c.version)).scalars())
+        if versions != [1]:
+            return
+        if (
+            _schema_contract(connection, table_names=self._user_table_names(connection))
+            != _expected_v1_schema_contract()
+        ):
+            raise RuntimeError("unsupported existing database schema")
+        connection.exec_driver_sql(
+            "ALTER TABLE normalized_snapshots "
+            "ADD COLUMN source_time_authoritative BOOLEAN NOT NULL DEFAULT 0"
+        )
+        quality_decisions.create(connection)
+        connection.execute(delete(schema_versions))
+        connection.execute(
+            insert(schema_versions).values(
+                version=SCHEMA_VERSION, applied_at=schema_applied_at()
+            )
+        )
 
     @staticmethod
     def _user_table_names(connection: Connection) -> set[str]:
@@ -349,7 +573,9 @@ class SnapshotRepository:
         self.parquet_root.mkdir(parents=True, exist_ok=True)
         root = self.parquet_root.resolve()
         known_paths: set[Path] = set()
-        for path_text in connection.execute(select(normalized_snapshots.c.parquet_path)).scalars():
+        for path_text in connection.execute(
+            select(normalized_snapshots.c.parquet_path)
+        ).scalars():
             try:
                 relative_path = self._safe_relative_path(cast(str, path_text))
             except RuntimeError:
@@ -385,12 +611,16 @@ class SnapshotRepository:
             raise RuntimeError("normalized snapshot index is inconsistent")
         self._parquet.verify(actual_path, snapshot_id, snapshot)
 
-    def _validated_index_path(self, row: Mapping[str, Any], snapshot: OptionChainSnapshot) -> Path:
+    def _validated_index_path(
+        self, row: Mapping[str, Any], snapshot: OptionChainSnapshot
+    ) -> Path:
         try:
             indexed_instrument = cast(str, row["instrument"])
             indexed_date = cast(date, row["session_date"])
             expected_path = self._parquet._relative_path(
-                cast(str, row["raw_snapshot_id"]), snapshot, snapshot.source_timestamp.date()
+                cast(str, row["raw_snapshot_id"]),
+                snapshot,
+                snapshot.source_timestamp.date(),
             )
         except (TypeError, ValueError) as error:
             raise RuntimeError("normalized snapshot index is inconsistent") from error
@@ -437,12 +667,16 @@ class SnapshotRepository:
     def _normalized_record(
         self, connection: Connection, snapshot_id: SnapshotId, content_sha256: str
     ) -> Mapping[str, Any] | None:
-        row = connection.execute(
-            select(normalized_snapshots).where(
-                normalized_snapshots.c.raw_snapshot_id == snapshot_id,
-                normalized_snapshots.c.content_sha256 == content_sha256,
+        row = (
+            connection.execute(
+                select(normalized_snapshots).where(
+                    normalized_snapshots.c.raw_snapshot_id == snapshot_id,
+                    normalized_snapshots.c.content_sha256 == content_sha256,
+                )
             )
-        ).mappings().one_or_none()
+            .mappings()
+            .one_or_none()
+        )
         return cast(Mapping[str, Any] | None, row)
 
     def _snapshot_from_rows(
@@ -457,6 +691,7 @@ class SnapshotRepository:
                 spot=cast(float, row["spot"]),
                 expiry=cast(date, row["expiry"]),
                 quotes=quotes,
+                source_time_authoritative=cast(bool, row["source_time_authoritative"]),
             )
         except (TypeError, ValueError) as error:
             raise RuntimeError("normalized snapshot index is inconsistent") from error
@@ -468,7 +703,9 @@ class SnapshotRepository:
         except zlib.error as error:
             raise RuntimeError(f"raw snapshot {snapshot_id} is corrupt") from error
         if _payload_digest(payload) != snapshot_id:
-            raise RuntimeError(f"raw snapshot {snapshot_id} failed integrity verification")
+            raise RuntimeError(
+                f"raw snapshot {snapshot_id} failed integrity verification"
+            )
         return payload
 
     @staticmethod

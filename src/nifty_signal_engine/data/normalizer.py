@@ -9,7 +9,6 @@ from zoneinfo import ZoneInfo
 from nifty_signal_engine.data.dhan_client import BrokerPayloadError, RawSnapshot
 from nifty_signal_engine.domain.market import OptionChainSnapshot, OptionQuote
 
-
 Instrument = Literal["NIFTY", "BANKNIFTY"]
 IST = ZoneInfo("Asia/Kolkata")
 _SIDES: tuple[tuple[str, Literal["CE", "PE"]], ...] = (("ce", "CE"), ("pe", "PE"))
@@ -23,7 +22,6 @@ def normalize_option_chain(
     _require_aware_timestamp(raw.captured_at, "captured_at")
     if received_at < raw.captured_at:
         raise BrokerPayloadError("received_at cannot precede captured_at")
-    captured_at = raw.captured_at.astimezone(IST)
     received_at_ist = received_at.astimezone(IST)
     if raw.expiry is None:
         raise BrokerPayloadError("raw option chain must retain its requested expiry")
@@ -34,6 +32,7 @@ def normalize_option_chain(
     if not isinstance(payload, dict):
         raise BrokerPayloadError("option chain root must be an object")
     data = _object(payload.get("data"), "data")
+    source_timestamp, source_time_authoritative = _source_provenance(raw, data)
     spot = _number(data.get("last_price"), "data.last_price", positive=True)
     strikes = _object(data.get("oc"), "data.oc")
     if not strikes:
@@ -58,19 +57,42 @@ def normalize_option_chain(
                         strike,
                         option_type,
                         raw,
-                        captured_at,
+                        source_timestamp,
                     )
                 )
         if present == 0:
             raise BrokerPayloadError(f"strike {raw_strike} has no option side")
     return OptionChainSnapshot(
         instrument=instrument,
-        source_timestamp=captured_at,
+        source_timestamp=source_timestamp,
         received_at=received_at_ist,
         spot=spot,
         expiry=raw.expiry,
         quotes=tuple(quotes),
+        source_time_authoritative=source_time_authoritative,
     )
+
+
+def _source_provenance(
+    raw: RawSnapshot, data: dict[str, object]
+) -> tuple[datetime, bool]:
+    if raw.source_time_authoritative:
+        if raw.broker_source_timestamp is None:
+            raise BrokerPayloadError("raw source-time provenance is inconsistent")
+        return raw.broker_source_timestamp.astimezone(IST), True
+    value = data.get("timestamp")
+    if value is None:
+        return raw.captured_at.astimezone(IST), False
+    if not isinstance(value, str):
+        raise BrokerPayloadError("data.timestamp must be an ISO-8601 timestamp")
+    try:
+        timestamp = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise BrokerPayloadError(
+            "data.timestamp must be an ISO-8601 timestamp"
+        ) from error
+    _require_aware_timestamp(timestamp, "data.timestamp")
+    return timestamp.astimezone(IST), True
 
 
 def _quote(

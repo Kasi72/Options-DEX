@@ -1,4 +1,11 @@
 {
+  "fixture_metadata": {
+    "captured_at": "2026-08-30T10:00:01+05:30",
+    "broker_source_timestamp": "2026-08-30T10:00:00+05:30",
+    "source_time_authoritative": true,
+    "expiry": "2026-09-01",
+    "trading_dates": ["2026-08-30"]
+  },
   "data": {
     "last_price": 24318.5,
     "oc": {
