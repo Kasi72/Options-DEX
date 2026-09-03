@@ -8,6 +8,7 @@ from pydantic import BaseModel, model_validator
 
 class OptionQuote(BaseModel, frozen=True):
     timestamp: datetime
+    timestamp_authoritative: bool = False
     strike: float
     option_type: Literal["CE", "PE"]
     expiry: date | None = None

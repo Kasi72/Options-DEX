@@ -120,13 +120,14 @@ class DhanClient:
         request = {**_request_for(instrument), "Expiry": expiry.isoformat()}
         body = await self._post_bytes("/optionchain", request)
         captured_at = self._clock()
-        source_timestamp = _optional_source_timestamp(body)
         return RawSnapshot(
             body=body,
             captured_at=captured_at,
             expiry=expiry,
-            broker_source_timestamp=source_timestamp,
-            source_time_authoritative=source_timestamp is not None,
+            # The documented option-chain response contains no source-time field.
+            # Preserve its bytes but do not invent authoritative market provenance.
+            broker_source_timestamp=None,
+            source_time_authoritative=False,
         )
 
     async def _post(
@@ -159,26 +160,6 @@ def is_transient_error(error: Exception) -> bool:
     return isinstance(error, (httpx.TimeoutException, httpx.TransportError)) or (
         isinstance(error, BrokerHTTPError) and error.transient
     )
-
-
-def _optional_source_timestamp(body: bytes) -> datetime | None:
-    """Extract only a valid documented source timestamp; leave malformed bytes raw-first."""
-    try:
-        payload = json.loads(body)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
-        return None
-    value = payload["data"].get("timestamp")
-    if not isinstance(value, str):
-        return None
-    try:
-        timestamp = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if timestamp.tzinfo is None or timestamp.tzinfo.utcoffset(timestamp) is None:
-        return None
-    return timestamp.astimezone(IST)
 
 
 def _request_for(instrument: Instrument) -> dict[str, int | str]:

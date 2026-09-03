@@ -51,7 +51,12 @@ def canonical_snapshot(snapshot: OptionChainSnapshot) -> OptionChainSnapshot:
             "source_timestamp": snapshot.source_timestamp.astimezone(IST),
             "received_at": snapshot.received_at.astimezone(IST),
             "quotes": tuple(
-                quote.model_copy(update={"timestamp": quote.timestamp.astimezone(IST)})
+                quote.model_copy(
+                    update={
+                        "timestamp": quote.timestamp.astimezone(IST),
+                        "timestamp_authoritative": snapshot.source_time_authoritative,
+                    }
+                )
                 for quote in snapshot.quotes
             ),
         }
@@ -61,6 +66,11 @@ def canonical_snapshot(snapshot: OptionChainSnapshot) -> OptionChainSnapshot:
 def snapshot_content_sha256(snapshot: OptionChainSnapshot) -> str:
     """Hash the canonical normalized snapshot for idempotent persistence."""
     canonical = canonical_snapshot(snapshot).model_dump(mode="json")
+    # This provenance marker was added after the original immutable layout. It
+    # is deterministically derived from snapshot provenance for option-chain
+    # snapshots, so retaining it in the digest would invalidate prior v2 paths.
+    for quote in canonical["quotes"]:
+        quote.pop("timestamp_authoritative", None)
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 

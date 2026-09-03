@@ -119,7 +119,17 @@ def test_missing_authoritative_source_time_is_explicitly_non_tradable() -> None:
 
     assert report.tradable is False
     assert DataQualityCode.SOURCE_TIME_UNAVAILABLE in report.codes
-    assert DataQualityCode.BASELINE_UNAVAILABLE in report.codes
+    assert DataQualityCode.QUOTE_TIME_UNAVAILABLE in report.codes
+
+
+def test_cross_instrument_baseline_is_never_used() -> None:
+    current = make_chain(timestamp="2026-08-26T10:00:00+05:30", call_volume=10)
+    previous = current.model_copy(update={"instrument": "BANKNIFTY"})
+
+    report = assess_snapshot(current, previous, current.source_timestamp)
+
+    assert report.tradable is False
+    assert DataQualityCode.BASELINE_INSTRUMENT_MISMATCH in report.codes
 
 
 def test_first_snapshot_after_session_rollover_requires_a_new_baseline() -> None:

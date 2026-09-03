@@ -99,9 +99,10 @@ def test_fetch_option_chain_uses_banknifty_identifier_and_expiry() -> None:
 
     assert raw.body == body
     assert raw.captured_at.tzinfo is not None
-    assert raw.source_time_authoritative is True
-    assert raw.broker_source_timestamp is not None
-    assert raw.broker_source_timestamp.isoformat() == "2026-08-30T09:59:58+05:30"
+    # `data.timestamp` is not part of Dhan's documented option-chain contract.
+    # It must remain raw evidence, never promoted to market-time provenance.
+    assert raw.source_time_authoritative is False
+    assert raw.broker_source_timestamp is None
 
 
 def test_http_error_retains_response_bytes_and_receipt_metadata_without_headers() -> (

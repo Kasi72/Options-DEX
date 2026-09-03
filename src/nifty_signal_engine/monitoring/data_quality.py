@@ -63,7 +63,13 @@ class DataQualityCode(StrEnum):
     FUTURE_SOURCE_TIME = "FUTURE_SOURCE_TIME"
     FUTURE_RECEIPT_TIME = "FUTURE_RECEIPT_TIME"
     QUOTE_TIMESTAMP_INVALID = "QUOTE_TIMESTAMP_INVALID"
+    QUOTE_TIME_UNAVAILABLE = "QUOTE_TIME_UNAVAILABLE"
     BASELINE_UNAVAILABLE = "BASELINE_UNAVAILABLE"
+    BASELINE_INSTRUMENT_MISMATCH = "BASELINE_INSTRUMENT_MISMATCH"
+    BASELINE_CORRUPT = "BASELINE_CORRUPT"
+    NOT_ASSESSED = "NOT_ASSESSED"
+    MIGRATED_UNASSESSED = "MIGRATED_UNASSESSED"
+    QUALITY_MISSING = "QUALITY_MISSING"
     SESSION_RESET = "SESSION_RESET"
     INSUFFICIENT_PAIRED_STRIKES = "INSUFFICIENT_PAIRED_STRIKES"
     EXCESSIVE_SPREAD = "EXCESSIVE_SPREAD"
@@ -189,6 +195,8 @@ def assess_snapshot(
             "expiry",
             "quote_expiry_differs_from_snapshot",
         )
+    if any(not quote.timestamp_authoritative for quote in current.quotes):
+        add(DataQualityCode.QUOTE_TIME_UNAVAILABLE, "quote_time", "not_authoritative")
     if any(
         _as_ist(quote.timestamp, "quote.timestamp") > source_timestamp
         or checked_at - _as_ist(quote.timestamp, "quote.timestamp")
@@ -215,7 +223,13 @@ def assess_snapshot(
 
     if previous is None:
         add(DataQualityCode.BASELINE_UNAVAILABLE, "baseline", "no_persisted_baseline")
-    elif previous.instrument == current.instrument:
+    elif previous.instrument != current.instrument:
+        add(
+            DataQualityCode.BASELINE_INSTRUMENT_MISMATCH,
+            "baseline",
+            "instrument_mismatch",
+        )
+    else:
         previous_timestamp = _as_ist(
             previous.source_timestamp, "previous.source_timestamp"
         )

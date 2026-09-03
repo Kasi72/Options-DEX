@@ -9,7 +9,10 @@ from nifty_signal_engine.data.collector import CollectionStatus, Collector
 from nifty_signal_engine.data.dhan_client import BrokerPayloadError, RawSnapshot
 from nifty_signal_engine.data.normalizer import normalize_option_chain
 from nifty_signal_engine.data.repositories import SnapshotRepository
-from nifty_signal_engine.monitoring.data_quality import DataQualityCode
+from nifty_signal_engine.monitoring.data_quality import (
+    DataQualityCode,
+    DataQualityReport,
+)
 from tests.factories import aware, make_chain
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
@@ -73,6 +76,25 @@ def test_collector_saves_immutable_raw_before_normalization_and_persists_researc
     assert len(list(repository.iter_session("NIFTY", date(2026, 8, 30)))) == 1
     assert result.quality is not None
     assert result.quality.tradable is False
+    repository.close()
+
+
+def test_collector_uses_raw_capture_as_the_normalized_receipt_time(tmp_path: Path) -> None:
+    """Sampling a second clock after persistence would mislabel HTTP receipt time."""
+    repository = SnapshotRepository(
+        database_path=tmp_path / "market.sqlite3", parquet_root=tmp_path / "parquet"
+    )
+    raw = _raw()
+    collector = Collector(
+        broker=_Broker(raw),
+        repository=repository,
+        clock=lambda: aware("2026-08-30T10:05:00+05:30"),
+    )
+
+    result = asyncio.run(collector.collect_once("NIFTY"))
+
+    assert result.snapshot is not None
+    assert result.snapshot.received_at == raw.captured_at
     repository.close()
 
 
@@ -357,3 +379,51 @@ def test_collector_restores_per_instrument_baseline_after_restart(
 
     assert result.quality is not None
     assert DataQualityCode.BASELINE_UNAVAILABLE not in result.quality.codes
+
+
+def test_corrupt_persisted_baseline_is_explicitly_nontradable(tmp_path: Path) -> None:
+    """A damaged state reference must not be replaced by another instrument's data."""
+    database_path = tmp_path / "market.sqlite3"
+    parquet_root = tmp_path / "parquet"
+    first = make_chain(timestamp="2026-08-30T10:00:00+05:30")
+    second = make_chain(timestamp="2026-08-30T10:01:00+05:30")
+
+    def assessor(current, _previous, now):
+        return DataQualityReport(tradable=True, codes=(), checked_at=now)
+
+    with SnapshotRepository(
+        database_path=database_path, parquet_root=parquet_root
+    ) as repository:
+        first_result = asyncio.run(
+            Collector(
+                broker=_Broker(_raw()),
+                repository=repository,
+                normalizer=lambda *_args: first,
+                quality_assessor=assessor,
+                clock=lambda: aware("2026-08-30T10:00:01+05:30"),
+            ).collect_once("NIFTY")
+        )
+        assert first_result.quality is not None
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE collector_state SET state = ? WHERE instrument = ?",
+            ('{"normalized_snapshot_id": 999999}', "NIFTY"),
+        )
+        connection.commit()
+
+    with SnapshotRepository(
+        database_path=database_path, parquet_root=parquet_root
+    ) as repository:
+        result = asyncio.run(
+            Collector(
+                broker=_Broker(_raw()),
+                repository=repository,
+                normalizer=lambda *_args: second,
+                quality_assessor=assessor,
+                clock=lambda: aware("2026-08-30T10:01:01+05:30"),
+            ).collect_once("NIFTY")
+        )
+
+    assert result.quality is not None
+    assert DataQualityCode.BASELINE_CORRUPT in result.quality.codes

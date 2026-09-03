@@ -66,3 +66,30 @@ None. Live requests were not made; all collection tests and smoke verification u
 ### Correction concerns
 
 The supplied sanitized fixture is dated on a weekend and has only one paired strike, so it is intentionally non-tradable. No live request, order, credential, or network side effect was used.
+
+## Critical correction round 2
+
+### Honest time provenance
+
+- The Dhan option-chain adapter no longer parses or trusts an undocumented payload timestamp. Its `RawSnapshot` contains the actual local HTTP capture only, with no authoritative source time. The normalizer likewise never promotes payload data to source provenance.
+- `OptionQuote.timestamp_authoritative` makes quote-time provenance explicit. Dhan placeholders inherit `False`, and quality rejects them with `QUOTE_TIME_UNAVAILABLE`; a trusted fixture or separately joined feed may provide explicit external source metadata. `RawSnapshot.captured_at` is persisted as `received_at` exactly, not replaced with a later collector clock sample.
+- Consequently, Dhan-only chain snapshots cannot become tradable until they are joined to an authoritative timestamped feed. Fixture mode remains a deterministic research-only path.
+
+### Atomic audit and recovery boundary
+
+- `publish_normalized_with_quality_and_baseline` holds the Task 7 writer transaction across Parquet publication, normalized indexes/quotes, one quality decision, and any approved per-instrument baseline update. An audit failure rolls back the normalized index; the next repository startup removes the unindexed Parquet orphan.
+- Generic `save_normalized` now atomically attaches one explicit non-tradable `NOT_ASSESSED` decision. `iter_tradable_session` is the opt-in usable replay iterator; `iter_session` rejects externally damaged rows missing an audit decision, and summaries expose `QUALITY_MISSING`.
+- The exact v1-to-v2 locked migration now backfills every preexisting normalized row with `MIGRATED_UNASSESSED`, so migration cannot create a quality-audit gap.
+
+### Baseline integrity
+
+- Restored collector state now checks the requested instrument, referenced normalized row, audit presence, canonical index/path/content, and Parquet artifact before returning a baseline. Instrument mismatch or corruption raises at the repository boundary; collector converts it to explicit non-tradable `BASELINE_CORRUPT` without substituting another instrument's state.
+- Direct cross-instrument assessment returns `BASELINE_INSTRUMENT_MISMATCH`.
+
+### Round-2 TDD and verification
+
+- RED/GREEN regressions cover ignored payload timestamps, external trusted provenance, capture-time receipt, quote-time unavailability, cross-instrument baselines, generic pending quality, atomic audit-write rollback, v1 quality backfill, and corrupted state references.
+- `py -m pytest tests/unit tests/integration -q` — 143 passed.
+- `py -m ruff check src tests` — passed.
+- `py -m mypy src` — no issues in 24 source files.
+- Deterministic fixture smoke and `inspect-session` passed with `COLLECTED`, `research_only: true`, `tradable: false`, and explicit quality codes. No live request, order submission, or credential emission occurred.

@@ -12,7 +12,10 @@ import pytest
 
 from nifty_signal_engine.data.repositories import SnapshotRepository
 from nifty_signal_engine.domain.market import OptionChainSnapshot
-from nifty_signal_engine.monitoring.data_quality import DataQualityReport
+from nifty_signal_engine.monitoring.data_quality import (
+    DataQualityCode,
+    DataQualityReport,
+)
 from tests.factories import make_chain
 
 
@@ -489,14 +492,65 @@ def test_quality_decision_and_collector_baseline_survive_repository_restart(
     assert summary == {"snapshot_count": 1, "tradable_count": 0, "codes": {}}
 
 
+def test_generic_normalized_publication_is_explicitly_nontradable(
+    repository: SnapshotRepository, raw_payload: bytes
+) -> None:
+    raw_id = repository.save_raw(raw_payload)
+    snapshot = make_chain(timestamp="2026-08-28T10:00:00+05:30")
+
+    repository.save_normalized(raw_id, snapshot)
+
+    assert repository.session_quality_summary("NIFTY", date(2026, 8, 28)) == {
+        "snapshot_count": 1,
+        "tradable_count": 0,
+        "codes": {"NOT_ASSESSED": 1},
+    }
+    assert list(repository.iter_tradable_session("NIFTY", date(2026, 8, 28))) == []
+
+
+def test_atomic_publish_rolls_back_index_when_quality_audit_fails(
+    repository: SnapshotRepository, raw_payload: bytes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash between Parquet write and audit insert cannot publish a usable index."""
+    raw_id = repository.save_raw(raw_payload)
+    snapshot = make_chain(timestamp="2026-08-28T10:00:00+05:30")
+    report = DataQualityReport(
+        tradable=False,
+        codes=(DataQualityCode.QUALITY_ASSESSMENT_FAILED,),
+        checked_at=snapshot.received_at,
+    )
+
+    def fail_audit(*_args: object) -> None:
+        raise RuntimeError("audit storage unavailable")
+
+    monkeypatch.setattr(repository, "_insert_quality_decision_locked", fail_audit)
+    with pytest.raises(RuntimeError, match="audit storage unavailable"):
+        repository.publish_normalized_with_quality_and_baseline(
+            raw_id, snapshot, report, baseline=False
+        )
+
+    assert list(repository.iter_session("NIFTY", date(2026, 8, 28))) == []
+    database_path = repository.database_path
+    parquet_root = repository.parquet_root
+    repository.close()
+    with SnapshotRepository(database_path=database_path, parquet_root=parquet_root):
+        pass
+    assert list(parquet_root.rglob("*.parquet")) == []
+
+
 def test_exact_v1_database_is_migrated_to_v2_under_the_writer_lock(
     tmp_path: Path,
 ) -> None:
     """Rejecting an otherwise exact v1 store must not strand prior immutable snapshots."""
     database_path = tmp_path / "market.sqlite3"
     parquet_root = tmp_path / "parquet"
-    with SnapshotRepository(database_path=database_path, parquet_root=parquet_root):
-        pass
+    with SnapshotRepository(
+        database_path=database_path, parquet_root=parquet_root
+    ) as repository:
+        raw_id = repository.save_raw(b'{"migration":"raw"}')
+        repository.save_normalized(
+            raw_id, make_chain(timestamp="2026-08-28T10:00:00+05:30")
+        )
     with sqlite3.connect(database_path) as connection:
         connection.execute("DROP TABLE quality_decisions")
         connection.execute(
@@ -508,8 +562,10 @@ def test_exact_v1_database_is_migrated_to_v2_under_the_writer_lock(
         )
         connection.commit()
 
-    with SnapshotRepository(database_path=database_path, parquet_root=parquet_root):
-        pass
+    with SnapshotRepository(
+        database_path=database_path, parquet_root=parquet_root
+    ) as repository:
+        summary = repository.session_quality_summary("NIFTY", date(2026, 8, 28))
 
     with sqlite3.connect(database_path) as connection:
         versions = connection.execute("SELECT version FROM schema_versions").fetchall()
@@ -523,6 +579,7 @@ def test_exact_v1_database_is_migrated_to_v2_under_the_writer_lock(
     assert versions == [(2,)]
     assert any(column[1] == "source_time_authoritative" for column in columns)
     assert quality_table == ("quality_decisions",)
+    assert summary["codes"] == {"MIGRATED_UNASSESSED": 1}
 
 
 def _create_v1_database(tmp_path: Path) -> tuple[Path, Path]:

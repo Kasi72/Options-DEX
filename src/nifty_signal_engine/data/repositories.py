@@ -39,7 +39,10 @@ from nifty_signal_engine.data.schema import (
     schema_versions,
 )
 from nifty_signal_engine.domain.market import OptionChainSnapshot, OptionQuote
-from nifty_signal_engine.monitoring.data_quality import DataQualityReport
+from nifty_signal_engine.monitoring.data_quality import (
+    DataQualityCode,
+    DataQualityReport,
+)
 
 IST: Final = ZoneInfo("Asia/Kolkata")
 SnapshotId = NewType("SnapshotId", str)
@@ -250,74 +253,157 @@ class SnapshotRepository:
     def save_normalized(
         self, snapshot_id: SnapshotId, snapshot: OptionChainSnapshot
     ) -> None:
-        """Publish Parquet and its SQLite index under one serialized writer boundary."""
+        """Publish only with an explicit fail-closed pending quality decision."""
         self.read_raw(snapshot_id)
+        with self._write_lock() as connection:
+            normalized_id = self._publish_normalized_locked(
+                connection, snapshot_id, snapshot
+            )
+            if not self._has_quality_decision(connection, normalized_id):
+                self._insert_quality_decision_locked(
+                    connection,
+                    normalized_id,
+                    DataQualityReport(
+                        tradable=False,
+                        codes=(DataQualityCode.NOT_ASSESSED,),
+                        checked_at=snapshot.received_at,
+                        details={"quality": "pending_explicit_assessment"},
+                    ),
+                )
+
+    def publish_normalized_with_quality_and_baseline(
+        self,
+        snapshot_id: SnapshotId,
+        snapshot: OptionChainSnapshot,
+        report: DataQualityReport,
+        *,
+        baseline: bool,
+    ) -> None:
+        """Atomically publish normalized data, exactly one audit, and baseline state."""
+        self.read_raw(snapshot_id)
+        with self._write_lock() as connection:
+            normalized_id = self._publish_normalized_locked(
+                connection, snapshot_id, snapshot
+            )
+            if self._has_quality_decision(connection, normalized_id):
+                raise RuntimeError("normalized snapshot already has a quality decision")
+            self._insert_quality_decision_locked(connection, normalized_id, report)
+            if baseline:
+                self._update_baseline_locked(
+                    connection, snapshot.instrument, normalized_id, report.checked_at
+                )
+
+    def _publish_normalized_locked(
+        self,
+        connection: Connection,
+        snapshot_id: SnapshotId,
+        snapshot: OptionChainSnapshot,
+    ) -> int:
+        """Write Parquet and its indexes while the caller owns the writer transaction."""
         canonical = canonical_snapshot(snapshot)
         content_sha256 = snapshot_content_sha256(canonical)
         expected_path = self._parquet._relative_path(
             snapshot_id, canonical, canonical.source_timestamp.date()
         )
+        existing = self._normalized_record(connection, snapshot_id, content_sha256)
+        if existing is not None:
+            self._verify_existing_publication(
+                existing, snapshot_id, canonical, expected_path
+            )
+            return cast(int, existing["id"])
 
-        with self._write_lock() as connection:
-            existing = self._normalized_record(connection, snapshot_id, content_sha256)
-            if existing is not None:
-                self._verify_existing_publication(
-                    existing, snapshot_id, canonical, expected_path
+        published = False
+        try:
+            relative_path = self._parquet.write(snapshot_id, canonical)
+            if relative_path != expected_path:
+                raise RuntimeError("Parquet writer produced an unexpected partition path")
+            published = True
+            result = connection.execute(
+                insert(normalized_snapshots)
+                .values(
+                    raw_snapshot_id=snapshot_id,
+                    content_sha256=content_sha256,
+                    instrument=canonical.instrument,
+                    session_date=canonical.source_timestamp.date(),
+                    source_timestamp=canonical.source_timestamp,
+                    received_at=canonical.received_at,
+                    spot=canonical.spot,
+                    expiry=canonical.expiry,
+                    source_time_authoritative=canonical.source_time_authoritative,
+                    parquet_path=relative_path.as_posix(),
                 )
-                return
+                .returning(normalized_snapshots.c.id)
+            )
+            normalized_id = cast(int, result.scalar_one())
+            connection.execute(
+                insert(option_quotes),
+                [
+                    {
+                        "normalized_snapshot_id": normalized_id,
+                        "ordinal": ordinal,
+                        "timestamp": quote.timestamp,
+                        "strike": quote.strike,
+                        "option_type": quote.option_type,
+                        "expiry": quote.expiry,
+                        "ltp": quote.ltp,
+                        "bid": quote.bid,
+                        "ask": quote.ask,
+                        "volume": quote.volume,
+                        "oi": quote.oi,
+                        "previous_oi": quote.previous_oi,
+                        "iv": quote.iv,
+                        "api_delta": quote.api_delta,
+                        "api_gamma": quote.api_gamma,
+                    }
+                    for ordinal, quote in enumerate(canonical.quotes)
+                ],
+            )
+            return normalized_id
+        except Exception:
+            if published:
+                self._remove_attempt_publication(expected_path)
+            raise
 
-            published = False
-            try:
-                relative_path = self._parquet.write(snapshot_id, canonical)
-                if relative_path != expected_path:
-                    raise RuntimeError(
-                        "Parquet writer produced an unexpected partition path"
-                    )
-                published = True
-                result = connection.execute(
-                    insert(normalized_snapshots)
-                    .values(
-                        raw_snapshot_id=snapshot_id,
-                        content_sha256=content_sha256,
-                        instrument=canonical.instrument,
-                        session_date=canonical.source_timestamp.date(),
-                        source_timestamp=canonical.source_timestamp,
-                        received_at=canonical.received_at,
-                        spot=canonical.spot,
-                        expiry=canonical.expiry,
-                        source_time_authoritative=canonical.source_time_authoritative,
-                        parquet_path=relative_path.as_posix(),
-                    )
-                    .returning(normalized_snapshots.c.id)
+    @staticmethod
+    def _has_quality_decision(connection: Connection, normalized_id: int) -> bool:
+        return (
+            connection.execute(
+                select(quality_decisions.c.id).where(
+                    quality_decisions.c.normalized_snapshot_id == normalized_id
                 )
-                normalized_id = cast(int, result.scalar_one())
-                connection.execute(
-                    insert(option_quotes),
-                    [
-                        {
-                            "normalized_snapshot_id": normalized_id,
-                            "ordinal": ordinal,
-                            "timestamp": quote.timestamp,
-                            "strike": quote.strike,
-                            "option_type": quote.option_type,
-                            "expiry": quote.expiry,
-                            "ltp": quote.ltp,
-                            "bid": quote.bid,
-                            "ask": quote.ask,
-                            "volume": quote.volume,
-                            "oi": quote.oi,
-                            "previous_oi": quote.previous_oi,
-                            "iv": quote.iv,
-                            "api_delta": quote.api_delta,
-                            "api_gamma": quote.api_gamma,
-                        }
-                        for ordinal, quote in enumerate(canonical.quotes)
-                    ],
-                )
-            except Exception:
-                if published:
-                    self._remove_attempt_publication(expected_path)
-                raise
+            ).scalar_one_or_none()
+            is not None
+        )
+
+    @staticmethod
+    def _insert_quality_decision_locked(
+        connection: Connection, normalized_id: int, report: DataQualityReport
+    ) -> None:
+        connection.execute(
+            insert(quality_decisions).values(
+                normalized_snapshot_id=normalized_id,
+                tradable=report.tradable,
+                codes=[str(code) for code in report.codes],
+                details=report.details,
+                checked_at=report.checked_at,
+            )
+        )
+
+    @staticmethod
+    def _update_baseline_locked(
+        connection: Connection, instrument: str, normalized_id: int, checked_at: datetime
+    ) -> None:
+        state_table = metadata.tables["collector_state"]
+        connection.execute(
+            delete(state_table).where(state_table.c.instrument == instrument)
+        )
+        connection.execute(
+            insert(state_table).values(
+                instrument=instrument,
+                state={"normalized_snapshot_id": normalized_id},
+                updated_at=checked_at,
+            )
+        )
 
     def iter_session(
         self, instrument: str, session_date: date
@@ -331,6 +417,52 @@ class SnapshotRepository:
                 .where(
                     normalized_snapshots.c.instrument == instrument,
                     normalized_snapshots.c.session_date == session_date,
+                )
+                .order_by(
+                    normalized_snapshots.c.source_timestamp,
+                    normalized_snapshots.c.received_at,
+                    normalized_snapshots.c.id,
+                )
+            ).mappings()
+            for row in rows:
+                typed_row = cast(Mapping[str, Any], row)
+                if not self._has_quality_decision(connection, cast(int, typed_row["id"])):
+                    raise RuntimeError("normalized snapshot is missing a quality decision")
+                quote_rows = connection.execute(
+                    select(option_quotes)
+                    .where(option_quotes.c.normalized_snapshot_id == typed_row["id"])
+                    .order_by(option_quotes.c.ordinal)
+                ).mappings()
+                snapshot = self._snapshot_from_rows(
+                    typed_row,
+                    (cast(Mapping[str, Any], quote_row) for quote_row in quote_rows),
+                )
+                relative_path = self._validated_index_path(typed_row, snapshot)
+                self._parquet.verify(
+                    relative_path, cast(str, typed_row["raw_snapshot_id"]), snapshot
+                )
+                yield snapshot
+
+    def iter_tradable_session(
+        self, instrument: str, session_date: date
+    ) -> Iterator[OptionChainSnapshot]:
+        """Yield only snapshots with an explicit positive audit decision."""
+        if instrument not in {"NIFTY", "BANKNIFTY"}:
+            raise ValueError(f"unsupported instrument: {instrument}")
+        with self._engine.connect() as connection:
+            tradable_ids = set(
+                connection.execute(
+                    select(quality_decisions.c.normalized_snapshot_id).where(
+                        quality_decisions.c.tradable.is_(True)
+                    )
+                ).scalars()
+            )
+            rows = connection.execute(
+                select(normalized_snapshots)
+                .where(
+                    normalized_snapshots.c.instrument == instrument,
+                    normalized_snapshots.c.session_date == session_date,
+                    normalized_snapshots.c.id.in_(tradable_ids),
                 )
                 .order_by(
                     normalized_snapshots.c.source_timestamp,
@@ -363,7 +495,7 @@ class SnapshotRepository:
         *,
         baseline: bool,
     ) -> None:
-        """Append an auditable decision and atomically update one instrument baseline."""
+        """Compatibility path that replaces only an explicit pending assessment."""
         canonical = canonical_snapshot(snapshot)
         content_sha256 = snapshot_content_sha256(canonical)
         with self._write_lock() as connection:
@@ -371,28 +503,25 @@ class SnapshotRepository:
             if record is None:
                 raise RuntimeError("quality requires a persisted normalized snapshot")
             normalized_id = cast(int, record["id"])
-            connection.execute(
-                insert(quality_decisions).values(
-                    normalized_snapshot_id=normalized_id,
-                    tradable=report.tradable,
-                    codes=[str(code) for code in report.codes],
-                    details=report.details,
-                    checked_at=report.checked_at,
-                )
+            existing = list(
+                connection.execute(
+                    select(quality_decisions.c.codes).where(
+                        quality_decisions.c.normalized_snapshot_id == normalized_id
+                    )
+                ).scalars()
             )
-            if baseline:
+            if existing and existing != [[str(DataQualityCode.NOT_ASSESSED)]]:
+                raise RuntimeError("normalized snapshot already has a quality decision")
+            if existing:
                 connection.execute(
-                    delete(metadata.tables["collector_state"]).where(
-                        metadata.tables["collector_state"].c.instrument
-                        == snapshot.instrument
+                    delete(quality_decisions).where(
+                        quality_decisions.c.normalized_snapshot_id == normalized_id
                     )
                 )
-                connection.execute(
-                    insert(metadata.tables["collector_state"]).values(
-                        instrument=snapshot.instrument,
-                        state={"normalized_snapshot_id": normalized_id},
-                        updated_at=report.checked_at,
-                    )
+            self._insert_quality_decision_locked(connection, normalized_id, report)
+            if baseline:
+                self._update_baseline_locked(
+                    connection, snapshot.instrument, normalized_id, report.checked_at
                 )
 
     def load_collector_baseline(self, instrument: str) -> OptionChainSnapshot | None:
@@ -424,14 +553,24 @@ class SnapshotRepository:
                     "collector state references a missing normalized snapshot"
                 )
             row = cast(Mapping[str, Any], record)
+            if row["instrument"] != instrument:
+                raise RuntimeError("collector state instrument mismatch")
+            normalized_id = cast(int, row["id"])
+            if not self._has_quality_decision(connection, normalized_id):
+                raise RuntimeError("collector state references unassessed normalized snapshot")
             quotes = connection.execute(
                 select(option_quotes)
                 .where(option_quotes.c.normalized_snapshot_id == row["id"])
                 .order_by(option_quotes.c.ordinal)
             ).mappings()
-            return self._snapshot_from_rows(
+            snapshot = self._snapshot_from_rows(
                 row, (cast(Mapping[str, Any], quote) for quote in quotes)
             )
+            relative_path = self._validated_index_path(row, snapshot)
+            self._parquet.verify(
+                relative_path, cast(str, row["raw_snapshot_id"]), snapshot
+            )
+            return snapshot
 
     def session_quality_summary(
         self, instrument: str, selected_date: date
@@ -461,6 +600,21 @@ class SnapshotRepository:
                     for code in recorded_codes:
                         if isinstance(code, str):
                             codes[code] = codes.get(code, 0) + 1
+            # There should be exactly one decision per snapshot. If storage has
+            # been externally damaged, surface it as an explicit fail-closed code.
+            decision_count = len(
+                list(
+                    connection.execute(
+                        select(quality_decisions.c.id).where(
+                            quality_decisions.c.normalized_snapshot_id.in_(snapshot_ids)
+                        )
+                    ).scalars()
+                )
+            )
+            if decision_count != len(snapshot_ids):
+                codes[str(DataQualityCode.QUALITY_MISSING)] = max(
+                    0, len(snapshot_ids) - decision_count
+                )
         return {
             "snapshot_count": len(snapshot_ids),
             "tradable_count": tradable_count,
@@ -483,6 +637,7 @@ class SnapshotRepository:
             with self._write_lock() as connection:
                 self._migrate_v1_if_needed(connection)
                 self._assert_supported_existing_database(connection)
+                self._backfill_missing_quality_locked(connection)
                 self._recover_orphaned_parquet_locked(connection)
             return
 
@@ -504,6 +659,7 @@ class SnapshotRepository:
                     )
                 )
                 self._assert_supported_existing_database(connection)
+            self._backfill_missing_quality_locked(connection)
             self._recover_orphaned_parquet_locked(connection)
 
     @contextmanager
@@ -552,12 +708,42 @@ class SnapshotRepository:
             "ADD COLUMN source_time_authoritative BOOLEAN NOT NULL DEFAULT 0"
         )
         quality_decisions.create(connection)
+        self._backfill_missing_quality_locked(
+            connection, code=DataQualityCode.MIGRATED_UNASSESSED
+        )
         connection.execute(delete(schema_versions))
         connection.execute(
             insert(schema_versions).values(
                 version=SCHEMA_VERSION, applied_at=schema_applied_at()
             )
         )
+
+    def _backfill_missing_quality_locked(
+        self,
+        connection: Connection,
+        *,
+        code: DataQualityCode = DataQualityCode.QUALITY_MISSING,
+    ) -> None:
+        """Make old/corrupt index rows explicitly non-tradable rather than usable."""
+        missing = connection.execute(
+            select(normalized_snapshots.c.id, normalized_snapshots.c.received_at)
+            .where(
+                ~normalized_snapshots.c.id.in_(
+                    select(quality_decisions.c.normalized_snapshot_id)
+                )
+            )
+        )
+        for normalized_id, received_at in missing:
+            self._insert_quality_decision_locked(
+                connection,
+                cast(int, normalized_id),
+                DataQualityReport(
+                    tradable=False,
+                    codes=(code,),
+                    checked_at=cast(datetime, received_at),
+                    details={"quality": "migration_or_recovery_backfill"},
+                ),
+            )
 
     @staticmethod
     def _user_table_names(connection: Connection) -> set[str]:
@@ -683,7 +869,18 @@ class SnapshotRepository:
         self, row: Mapping[str, Any], quote_rows: Iterator[Mapping[str, Any]]
     ) -> OptionChainSnapshot:
         try:
-            quotes = tuple(self._quote_from_row(quote_row) for quote_row in quote_rows)
+            source_time_authoritative = cast(
+                bool, row["source_time_authoritative"]
+            )
+            # The option-chain normalizer gives every quote the snapshot source
+            # provenance; retain that explicit contract on replay without
+            # treating local placeholders as authoritative.
+            quotes = tuple(
+                self._quote_from_row(
+                    quote_row, timestamp_authoritative=source_time_authoritative
+                )
+                for quote_row in quote_rows
+            )
             return OptionChainSnapshot(
                 instrument=cast(Literal["NIFTY", "BANKNIFTY"], row["instrument"]),
                 source_timestamp=self._as_ist(cast(datetime, row["source_timestamp"])),
@@ -691,7 +888,7 @@ class SnapshotRepository:
                 spot=cast(float, row["spot"]),
                 expiry=cast(date, row["expiry"]),
                 quotes=quotes,
-                source_time_authoritative=cast(bool, row["source_time_authoritative"]),
+                source_time_authoritative=source_time_authoritative,
             )
         except (TypeError, ValueError) as error:
             raise RuntimeError("normalized snapshot index is inconsistent") from error
@@ -714,9 +911,12 @@ class SnapshotRepository:
             return value.replace(tzinfo=IST)
         return value.astimezone(IST)
 
-    def _quote_from_row(self, row: Mapping[str, Any]) -> OptionQuote:
+    def _quote_from_row(
+        self, row: Mapping[str, Any], *, timestamp_authoritative: bool
+    ) -> OptionQuote:
         return OptionQuote(
             timestamp=self._as_ist(cast(datetime, row["timestamp"])),
+            timestamp_authoritative=timestamp_authoritative,
             strike=cast(float, row["strike"]),
             option_type=cast(Literal["CE", "PE"], row["option_type"]),
             expiry=cast(date | None, row["expiry"]),

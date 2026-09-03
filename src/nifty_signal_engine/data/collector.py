@@ -132,7 +132,9 @@ class Collector:
             )
 
         raw_snapshot_id = self._repository.save_raw(raw.body)
-        received_at = self._clock()
+        # RawSnapshot captures the actual HTTP receipt. Do not resample a later
+        # clock after raw publication and misrepresent it as broker receipt time.
+        received_at = raw.captured_at
         try:
             snapshot = self._normalizer(raw, instrument, received_at)
         except (BrokerPayloadError, ValueError) as error:
@@ -147,8 +149,12 @@ class Collector:
                 selected_expiry=active_expiries[0],
             )
 
-        self._repository.save_normalized(raw_snapshot_id, snapshot)
-        previous = self._previous_for(instrument)
+        baseline_error = False
+        try:
+            previous = self._previous_for(instrument)
+        except RuntimeError:
+            previous = None
+            baseline_error = True
         try:
             if self._quality_assessor is assess_snapshot:
                 quality = assess_snapshot(
@@ -168,7 +174,7 @@ class Collector:
                 checked_at=received_at,
                 details={"error_type": type(error).__name__},
             )
-            self._repository.record_quality_and_baseline(
+            self._repository.publish_normalized_with_quality_and_baseline(
                 raw_snapshot_id, snapshot, quality, baseline=False
             )
             return CollectionResult(
@@ -181,8 +187,18 @@ class Collector:
                 active_expiries=active_expiries,
                 selected_expiry=active_expiries[0],
             )
-        baseline = DataQualityCode.OUT_OF_ORDER not in quality.codes
-        self._repository.record_quality_and_baseline(
+        if baseline_error:
+            quality = quality.model_copy(
+                update={
+                    "tradable": False,
+                    "codes": tuple((*quality.codes, DataQualityCode.BASELINE_CORRUPT)),
+                    "details": {**quality.details, "baseline": "repository_corrupt"},
+                }
+            )
+        baseline = (
+            DataQualityCode.OUT_OF_ORDER not in quality.codes and not baseline_error
+        )
+        self._repository.publish_normalized_with_quality_and_baseline(
             raw_snapshot_id, snapshot, quality, baseline=baseline
         )
         if baseline:
