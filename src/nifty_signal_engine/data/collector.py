@@ -155,26 +155,29 @@ class Collector:
         except RuntimeError:
             previous = None
             baseline_error = True
+        # Receipt provenance remains the raw capture; assessment freshness is
+        # evaluated at the independently sampled time work actually completed.
+        assessed_at = self._clock()
         try:
             if self._quality_assessor is assess_snapshot:
                 quality = assess_snapshot(
                     snapshot,
                     previous,
-                    received_at,
+                    assessed_at,
                     calendar=self._calendar,
                     active_expiries=active_expiries,
                     config=self._quality_config,
                 )
             else:
-                quality = self._quality_assessor(snapshot, previous, received_at)
+                quality = self._quality_assessor(snapshot, previous, assessed_at)
         except Exception as error:  # noqa: BLE001 - must persist a fail-closed audit decision.
             quality = DataQualityReport(
                 tradable=False,
                 codes=(DataQualityCode.QUALITY_ASSESSMENT_FAILED,),
-                checked_at=received_at,
+                checked_at=assessed_at,
                 details={"error_type": type(error).__name__},
             )
-            self._repository.publish_normalized_with_quality_and_baseline(
+            quality = self._repository.publish_normalized_with_quality_and_baseline(
                 raw_snapshot_id, snapshot, quality, baseline=False
             )
             return CollectionResult(
@@ -198,7 +201,7 @@ class Collector:
         baseline = (
             DataQualityCode.OUT_OF_ORDER not in quality.codes and not baseline_error
         )
-        self._repository.publish_normalized_with_quality_and_baseline(
+        quality = self._repository.publish_normalized_with_quality_and_baseline(
             raw_snapshot_id, snapshot, quality, baseline=baseline
         )
         if baseline:

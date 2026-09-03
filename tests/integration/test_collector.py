@@ -98,6 +98,36 @@ def test_collector_uses_raw_capture_as_the_normalized_receipt_time(tmp_path: Pat
     repository.close()
 
 
+def test_collector_assesses_at_the_current_clock_not_the_http_receipt(
+    tmp_path: Path,
+) -> None:
+    """Delayed persistence must not make a five-minute-old capture look fresh."""
+    repository = SnapshotRepository(
+        database_path=tmp_path / "market.sqlite3", parquet_root=tmp_path / "parquet"
+    )
+    observed: list[object] = []
+
+    def assessor(_current, _previous, checked_at):
+        observed.append(checked_at)
+        return DataQualityReport(tradable=True, codes=(), checked_at=checked_at)
+
+    result = asyncio.run(
+        Collector(
+            broker=_Broker(_raw()),
+            repository=repository,
+            quality_assessor=assessor,
+            clock=lambda: aware("2026-08-30T10:05:00+05:30"),
+        ).collect_once("NIFTY")
+    )
+
+    assert result.snapshot is not None
+    assert result.snapshot.received_at == aware("2026-08-30T10:00:00+05:30")
+    assert observed == [aware("2026-08-30T10:05:00+05:30")]
+    assert result.quality is not None
+    assert result.quality.checked_at == aware("2026-08-30T10:05:00+05:30")
+    repository.close()
+
+
 def test_collector_keeps_raw_bytes_when_strict_normalization_rejects_them(
     tmp_path: Path,
 ) -> None:

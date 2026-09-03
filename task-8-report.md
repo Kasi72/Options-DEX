@@ -93,3 +93,12 @@ The supplied sanitized fixture is dated on a weekend and has only one paired str
 - `py -m ruff check src tests` — passed.
 - `py -m mypy src` — no issues in 24 source files.
 - Deterministic fixture smoke and `inspect-session` passed with `COLLECTED`, `research_only: true`, `tradable: false`, and explicit quality codes. No live request, order submission, or credential emission occurred.
+
+## Critical correction round 3
+
+- Receipt provenance and assessment timing are separate: normalized `received_at` remains the original `RawSnapshot.captured_at`, while freshness, report `checked_at`, and quality decisions use a new clock sample taken after normalization/persistence work.
+- Schema v3 adds persisted per-quote `timestamp_authoritative` state to SQLite and Parquet. Canonicalization and content identity preserve each quote's flag independently; a trusted snapshot source cannot make an untrusted quote timestamp tradable on replay.
+- The locked migration explicitly supports exact v1 and v2 contracts. `serialization_version` records the historical content/path contract (v1, v2, or v3), so immutable v1 Parquet files are verified against their original hash/table contract rather than silently rehashed. Legacy quote provenance remains `false` and v1 audit rows remain quarantined as `MIGRATED_UNASSESSED`.
+- Exact duplicate reobservations reuse their existing immutable normalized artifact and audit decision without appending an audit or moving collector state backward. Content-distinct observations remain separate immutable snapshots.
+
+Round-3 RED/GREEN coverage includes delayed assessment, mixed source/quote provenance roundtrip, genuine v1-format Parquet replay after restart, v2-to-v3 migration, and repeated fixture collection. Verification: `py -m pytest tests/unit tests/integration -q` — 148 passed; `py -m ruff check src tests` and `py -m mypy src` passed. No live request, order, or credential output was used.

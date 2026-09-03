@@ -21,7 +21,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 IST = ZoneInfo("Asia/Kolkata")
 
 
@@ -93,6 +93,13 @@ normalized_snapshots = Table(
         default=False,
         server_default="0",
     ),
+    Column(
+        "serialization_version",
+        Integer,
+        nullable=False,
+        default=3,
+        server_default="3",
+    ),
     Column("parquet_path", String, nullable=False),
     UniqueConstraint(
         "raw_snapshot_id", "content_sha256", name="uq_normalized_snapshot_content"
@@ -111,6 +118,13 @@ option_quotes = Table(
     ),
     Column("ordinal", Integer, nullable=False),
     Column("timestamp", ISTDateTime(), nullable=False),
+    Column(
+        "timestamp_authoritative",
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="0",
+    ),
     Column("strike", Float, nullable=False),
     Column("option_type", String(2), nullable=False),
     Column("expiry", Date, nullable=True),

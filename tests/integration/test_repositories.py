@@ -10,6 +10,11 @@ from shutil import copyfile
 
 import pytest
 
+from nifty_signal_engine.data.parquet_store import (
+    ParquetSnapshotStore,
+    canonical_snapshot,
+    snapshot_content_sha256,
+)
 from nifty_signal_engine.data.repositories import SnapshotRepository
 from nifty_signal_engine.domain.market import OptionChainSnapshot
 from nifty_signal_engine.monitoring.data_quality import (
@@ -51,7 +56,7 @@ def test_schema_uses_wal_and_records_current_version(
         versions = connection.execute("SELECT version FROM schema_versions").fetchall()
 
     assert journal_mode == ("wal",)
-    assert versions == [(2,)]
+    assert versions == [(3,)]
 
 
 def test_sqlite_timestamps_preserve_the_required_ist_offset(
@@ -412,7 +417,7 @@ def test_existing_schema_without_required_unique_index_is_rejected_without_mutat
     assert database_path.read_bytes() == before
 
 
-def test_simultaneous_first_initialization_installs_one_valid_v2_schema(
+def test_simultaneous_first_initialization_installs_one_valid_v3_schema(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Changing post-lock initialization to trust a stale pristine check must fail here."""
@@ -456,7 +461,7 @@ def test_simultaneous_first_initialization_installs_one_valid_v2_schema(
     assert len(repositories) == 2
     with sqlite3.connect(database_path) as connection:
         assert connection.execute("SELECT version FROM schema_versions").fetchall() == [
-            (2,)
+            (3,)
         ]
 
 
@@ -508,6 +513,30 @@ def test_generic_normalized_publication_is_explicitly_nontradable(
     assert list(repository.iter_tradable_session("NIFTY", date(2026, 8, 28))) == []
 
 
+def test_quote_provenance_survives_normalized_roundtrip(
+    repository: SnapshotRepository, raw_payload: bytes
+) -> None:
+    """Snapshot authority must not overwrite a deliberately untrusted quote time."""
+    raw_id = repository.save_raw(raw_payload)
+    snapshot = make_chain(timestamp="2026-08-28T10:00:00+05:30").model_copy(
+        update={"source_time_authoritative": True}
+    )
+    snapshot = snapshot.model_copy(
+        update={
+            "quotes": tuple(
+                quote.model_copy(update={"timestamp_authoritative": False})
+                for quote in snapshot.quotes
+            )
+        }
+    )
+
+    repository.save_normalized(raw_id, snapshot)
+    restored = next(repository.iter_session("NIFTY", date(2026, 8, 28)))
+
+    assert restored.source_time_authoritative is True
+    assert {quote.timestamp_authoritative for quote in restored.quotes} == {False}
+
+
 def test_atomic_publish_rolls_back_index_when_quality_audit_fails(
     repository: SnapshotRepository, raw_payload: bytes, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -538,7 +567,7 @@ def test_atomic_publish_rolls_back_index_when_quality_audit_fails(
     assert list(parquet_root.rglob("*.parquet")) == []
 
 
-def test_exact_v1_database_is_migrated_to_v2_under_the_writer_lock(
+def test_exact_v1_database_is_migrated_to_v3_under_the_writer_lock(
     tmp_path: Path,
 ) -> None:
     """Rejecting an otherwise exact v1 store must not strand prior immutable snapshots."""
@@ -553,6 +582,12 @@ def test_exact_v1_database_is_migrated_to_v2_under_the_writer_lock(
         )
     with sqlite3.connect(database_path) as connection:
         connection.execute("DROP TABLE quality_decisions")
+        connection.execute(
+            "ALTER TABLE option_quotes DROP COLUMN timestamp_authoritative"
+        )
+        connection.execute(
+            "ALTER TABLE normalized_snapshots DROP COLUMN serialization_version"
+        )
         connection.execute(
             "ALTER TABLE normalized_snapshots DROP COLUMN source_time_authoritative"
         )
@@ -576,10 +611,134 @@ def test_exact_v1_database_is_migrated_to_v2_under_the_writer_lock(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'quality_decisions'"
         ).fetchone()
 
-    assert versions == [(2,)]
+    assert versions == [(3,)]
     assert any(column[1] == "source_time_authoritative" for column in columns)
+    assert any(column[1] == "serialization_version" for column in columns)
     assert quality_table == ("quality_decisions",)
     assert summary["codes"] == {"MIGRATED_UNASSESSED": 1}
+
+
+def test_historical_v1_parquet_hash_and_path_replay_after_migration(
+    tmp_path: Path,
+) -> None:
+    """A real v1 serialization omits provenance fields yet remains strictly verifiable."""
+    database_path = tmp_path / "market.sqlite3"
+    parquet_root = tmp_path / "parquet"
+    snapshot = canonical_snapshot(make_chain(timestamp="2026-08-28T10:00:00+05:30"))
+    with SnapshotRepository(
+        database_path=database_path, parquet_root=parquet_root
+    ) as repository:
+        raw_id = repository.save_raw(b'{"historical":"v1"}')
+
+    legacy_store = ParquetSnapshotStore(parquet_root)
+    legacy_path = legacy_store.write(raw_id, snapshot, serialization_version=1)
+    legacy_hash = snapshot_content_sha256(snapshot, serialization_version=1)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP TABLE quality_decisions")
+        connection.execute(
+            "ALTER TABLE option_quotes DROP COLUMN timestamp_authoritative"
+        )
+        connection.execute(
+            "ALTER TABLE normalized_snapshots DROP COLUMN serialization_version"
+        )
+        connection.execute(
+            "ALTER TABLE normalized_snapshots DROP COLUMN source_time_authoritative"
+        )
+        connection.execute(
+            "INSERT INTO normalized_snapshots "
+            "(raw_snapshot_id, content_sha256, instrument, session_date, "
+            "source_timestamp, received_at, spot, expiry, parquet_path) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                raw_id,
+                legacy_hash,
+                snapshot.instrument,
+                snapshot.source_timestamp.date().isoformat(),
+                snapshot.source_timestamp.isoformat(),
+                snapshot.received_at.isoformat(),
+                snapshot.spot,
+                snapshot.expiry.isoformat(),
+                legacy_path.as_posix(),
+            ),
+        )
+        normalized_id = connection.execute(
+            "SELECT id FROM normalized_snapshots"
+        ).fetchone()[0]
+        for ordinal, quote in enumerate(snapshot.quotes):
+            connection.execute(
+                "INSERT INTO option_quotes "
+                "(normalized_snapshot_id, ordinal, timestamp, strike, option_type, expiry, "
+                "ltp, bid, ask, volume, oi, previous_oi, iv, api_delta, api_gamma) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    normalized_id,
+                    ordinal,
+                    quote.timestamp.isoformat(),
+                    quote.strike,
+                    quote.option_type,
+                    quote.expiry.isoformat() if quote.expiry else None,
+                    quote.ltp,
+                    quote.bid,
+                    quote.ask,
+                    quote.volume,
+                    quote.oi,
+                    quote.previous_oi,
+                    quote.iv,
+                    quote.api_delta,
+                    quote.api_gamma,
+                ),
+            )
+        connection.execute("DELETE FROM schema_versions")
+        connection.execute(
+            "INSERT INTO schema_versions (version, applied_at) VALUES (1, ?) ",
+            (snapshot.received_at.isoformat(),),
+        )
+        connection.commit()
+
+    with SnapshotRepository(
+        database_path=database_path, parquet_root=parquet_root
+    ) as repository:
+        restored = next(repository.iter_session("NIFTY", date(2026, 8, 28)))
+        summary = repository.session_quality_summary("NIFTY", date(2026, 8, 28))
+
+    assert restored == snapshot
+    assert summary["codes"] == {"MIGRATED_UNASSESSED": 1}
+
+
+def test_exact_v2_database_gets_a_versioned_quote_provenance_migration(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.sqlite3"
+    parquet_root = tmp_path / "parquet"
+    with SnapshotRepository(database_path=database_path, parquet_root=parquet_root):
+        pass
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "ALTER TABLE option_quotes DROP COLUMN timestamp_authoritative"
+        )
+        connection.execute(
+            "ALTER TABLE normalized_snapshots DROP COLUMN serialization_version"
+        )
+        connection.execute("DELETE FROM schema_versions")
+        connection.execute(
+            "INSERT INTO schema_versions (version, applied_at) VALUES (2, ?) ",
+            ("2026-08-28T09:15:00+05:30",),
+        )
+        connection.commit()
+
+    with (
+        SnapshotRepository(database_path=database_path, parquet_root=parquet_root) as repository,
+        sqlite3.connect(repository.database_path) as connection,
+    ):
+        version = connection.execute("SELECT version FROM schema_versions").fetchall()
+        quote_columns = connection.execute("PRAGMA table_info(option_quotes)").fetchall()
+        snapshot_columns = connection.execute(
+            "PRAGMA table_info(normalized_snapshots)"
+        ).fetchall()
+
+    assert version == [(3,)]
+    assert any(column[1] == "timestamp_authoritative" for column in quote_columns)
+    assert any(column[1] == "serialization_version" for column in snapshot_columns)
 
 
 def _create_v1_database(tmp_path: Path) -> tuple[Path, Path]:

@@ -28,6 +28,7 @@ PARQUET_SCHEMA: Final = pa.schema(
         pa.field("spot", pa.float64(), nullable=False),
         pa.field("snapshot_expiry", pa.date32(), nullable=False),
         pa.field("quote_timestamp", pa.timestamp("us", tz="Asia/Kolkata"), nullable=False),
+        pa.field("quote_timestamp_authoritative", pa.bool_(), nullable=False),
         pa.field("strike", pa.float64(), nullable=False),
         pa.field("option_type", pa.string(), nullable=False),
         pa.field("expiry", pa.date32()),
@@ -42,6 +43,9 @@ PARQUET_SCHEMA: Final = pa.schema(
         pa.field("api_gamma", pa.float64()),
     ]
 )
+LEGACY_PARQUET_SCHEMA: Final = pa.schema(
+    [field for field in PARQUET_SCHEMA if field.name != "quote_timestamp_authoritative"]
+)
 
 
 def canonical_snapshot(snapshot: OptionChainSnapshot) -> OptionChainSnapshot:
@@ -51,26 +55,27 @@ def canonical_snapshot(snapshot: OptionChainSnapshot) -> OptionChainSnapshot:
             "source_timestamp": snapshot.source_timestamp.astimezone(IST),
             "received_at": snapshot.received_at.astimezone(IST),
             "quotes": tuple(
-                quote.model_copy(
-                    update={
-                        "timestamp": quote.timestamp.astimezone(IST),
-                        "timestamp_authoritative": snapshot.source_time_authoritative,
-                    }
-                )
+                quote.model_copy(update={"timestamp": quote.timestamp.astimezone(IST)})
                 for quote in snapshot.quotes
             ),
         }
     )
 
 
-def snapshot_content_sha256(snapshot: OptionChainSnapshot) -> str:
+def snapshot_content_sha256(
+    snapshot: OptionChainSnapshot, *, serialization_version: int = 3
+) -> str:
     """Hash the canonical normalized snapshot for idempotent persistence."""
     canonical = canonical_snapshot(snapshot).model_dump(mode="json")
-    # This provenance marker was added after the original immutable layout. It
-    # is deterministically derived from snapshot provenance for option-chain
-    # snapshots, so retaining it in the digest would invalidate prior v2 paths.
-    for quote in canonical["quotes"]:
-        quote.pop("timestamp_authoritative", None)
+    if serialization_version == 1:
+        canonical.pop("source_time_authoritative", None)
+        for quote in canonical["quotes"]:
+            quote.pop("timestamp_authoritative", None)
+    elif serialization_version == 2:
+        for quote in canonical["quotes"]:
+            quote.pop("timestamp_authoritative", None)
+    elif serialization_version != 3:
+        raise ValueError("unsupported snapshot serialization version")
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -81,11 +86,15 @@ class ParquetSnapshotStore:
     def __init__(self, root: Path) -> None:
         self.root = root
 
-    def write(self, raw_snapshot_id: str, snapshot: OptionChainSnapshot) -> Path:
+    def write(
+        self, raw_snapshot_id: str, snapshot: OptionChainSnapshot, *, serialization_version: int = 3
+    ) -> Path:
         """Atomically publish canonical strike records and return their relative path."""
         canonical = canonical_snapshot(snapshot)
         session_date = canonical.source_timestamp.date()
-        relative_path = self._relative_path(raw_snapshot_id, canonical, session_date)
+        relative_path = self._relative_path(
+            raw_snapshot_id, canonical, session_date, serialization_version=serialization_version
+        )
         destination = self.root / relative_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists():
@@ -93,7 +102,11 @@ class ParquetSnapshotStore:
 
         temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
         try:
-            pq.write_table(self._table(raw_snapshot_id, canonical, session_date), temporary, compression="zstd")
+            pq.write_table(
+                self._table(raw_snapshot_id, canonical, session_date, serialization_version=serialization_version),
+                temporary,
+                compression="zstd",
+            )
             os.replace(temporary, destination)
         finally:
             if temporary.exists():
@@ -101,12 +114,22 @@ class ParquetSnapshotStore:
         return relative_path
 
     def verify(
-        self, relative_path: Path, raw_snapshot_id: str, snapshot: OptionChainSnapshot
+        self,
+        relative_path: Path,
+        raw_snapshot_id: str,
+        snapshot: OptionChainSnapshot,
+        *,
+        serialization_version: int = 3,
     ) -> None:
         """Reject missing, malformed, or substituted immutable Parquet artifacts."""
         destination = self.root / relative_path
         canonical = canonical_snapshot(snapshot)
-        expected = self._table(raw_snapshot_id, canonical, canonical.source_timestamp.date())
+        expected = self._table(
+            raw_snapshot_id,
+            canonical,
+            canonical.source_timestamp.date(),
+            serialization_version=serialization_version,
+        )
         try:
             actual = pq.ParquetFile(destination).read()
         except (OSError, pa.ArrowException) as error:
@@ -115,9 +138,16 @@ class ParquetSnapshotStore:
             raise RuntimeError("Parquet artifact failed integrity verification")
 
     def _relative_path(
-        self, raw_snapshot_id: str, snapshot: OptionChainSnapshot, session_date: date
+        self,
+        raw_snapshot_id: str,
+        snapshot: OptionChainSnapshot,
+        session_date: date,
+        *,
+        serialization_version: int = 3,
     ) -> Path:
-        content_hash = snapshot_content_sha256(snapshot)
+        content_hash = snapshot_content_sha256(
+            snapshot, serialization_version=serialization_version
+        )
         return (
             Path(f"instrument={snapshot.instrument}")
             / f"session_date={session_date.isoformat()}"
@@ -125,11 +155,16 @@ class ParquetSnapshotStore:
         )
 
     @staticmethod
-    def _table(raw_snapshot_id: str, snapshot: OptionChainSnapshot, session_date: date) -> pa.Table:
+    def _table(
+        raw_snapshot_id: str,
+        snapshot: OptionChainSnapshot,
+        session_date: date,
+        *,
+        serialization_version: int = 3,
+    ) -> pa.Table:
         rows: list[dict[str, object]] = []
         for quote in snapshot.quotes:
-            rows.append(
-                {
+            row: dict[str, object] = {
                     "raw_snapshot_id": raw_snapshot_id,
                     "instrument": snapshot.instrument,
                     "session_date": session_date,
@@ -138,6 +173,7 @@ class ParquetSnapshotStore:
                     "spot": snapshot.spot,
                     "snapshot_expiry": snapshot.expiry,
                     "quote_timestamp": quote.timestamp,
+                    "quote_timestamp_authoritative": quote.timestamp_authoritative,
                     "strike": quote.strike,
                     "option_type": quote.option_type,
                     "expiry": quote.expiry,
@@ -150,6 +186,11 @@ class ParquetSnapshotStore:
                     "iv": quote.iv,
                     "api_delta": quote.api_delta,
                     "api_gamma": quote.api_gamma,
-                }
-            )
-        return pa.Table.from_pylist(rows, schema=PARQUET_SCHEMA)
+            }
+            if serialization_version in {1, 2}:
+                row.pop("quote_timestamp_authoritative")
+            elif serialization_version != 3:
+                raise ValueError("unsupported snapshot serialization version")
+            rows.append(row)
+        schema = PARQUET_SCHEMA if serialization_version == 3 else LEGACY_PARQUET_SCHEMA
+        return pa.Table.from_pylist(rows, schema=schema)

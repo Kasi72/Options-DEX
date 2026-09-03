@@ -52,7 +52,7 @@ SchemaContract = tuple[
 
 
 @lru_cache
-def _expected_v2_schema_contract() -> SchemaContract:
+def _expected_v3_schema_contract() -> SchemaContract:
     """Derive the current SQLite contract from the code-defined metadata."""
     return _expected_schema_contract(metadata)
 
@@ -63,40 +63,113 @@ def _expected_v1_schema_contract() -> SchemaContract:
     legacy_tables: list[
         tuple[str, tuple[object, ...], tuple[object, ...], tuple[object, ...]]
     ] = []
-    for table_name, columns, indexes, foreign_keys in _expected_v2_schema_contract():
+    for table_name, columns, indexes, foreign_keys in _expected_v3_schema_contract():
         if table_name == "quality_decisions":
             continue
         if table_name == "normalized_snapshots":
             columns = tuple(
                 column
                 for column in columns
-                if cast(tuple[object, ...], column)[0] != "source_time_authoritative"
+                if cast(tuple[object, ...], column)[0]
+                not in {"source_time_authoritative", "serialization_version"}
+            )
+        if table_name == "option_quotes":
+            columns = tuple(
+                column
+                for column in columns
+                if cast(tuple[object, ...], column)[0] != "timestamp_authoritative"
             )
         legacy_tables.append((table_name, columns, indexes, foreign_keys))
     return tuple(legacy_tables)
 
 
 @lru_cache
-def _expected_migrated_v2_schema_contract() -> SchemaContract:
-    """Accept the one deterministic SQLite layout produced by the locked v1 upgrade."""
+def _expected_v2_schema_contract(*, migrated_from_v1: bool = False) -> SchemaContract:
+    """Reconstruct exact v2 layouts before the quote-provenance migration."""
     migrated: list[
         tuple[str, tuple[object, ...], tuple[object, ...], tuple[object, ...]]
     ] = []
-    for table_name, columns, indexes, foreign_keys in _expected_v2_schema_contract():
+    for table_name, columns, indexes, foreign_keys in _expected_v3_schema_contract():
         if table_name == "normalized_snapshots":
             source_column = next(
                 cast(tuple[object, ...], column)
                 for column in columns
                 if cast(tuple[object, ...], column)[0] == "source_time_authoritative"
             )
-            source_column = (*cast(tuple[object, ...], source_column)[:-1], "0")
+            if migrated_from_v1:
+                source_column = (*cast(tuple[object, ...], source_column)[:-1], "0")
             columns = tuple(
                 column
                 for column in columns
-                if cast(tuple[object, ...], column)[0] != "source_time_authoritative"
-            ) + (source_column,)
+                if cast(tuple[object, ...], column)[0]
+                not in {"source_time_authoritative", "serialization_version"}
+            )
+            if migrated_from_v1:
+                columns += (source_column,)
+            else:
+                parquet_column = next(
+                    column
+                    for column in columns
+                    if cast(tuple[object, ...], column)[0] == "parquet_path"
+                )
+                columns = tuple(column for column in columns if column != parquet_column)
+                columns += (source_column, parquet_column)
+        if table_name == "option_quotes":
+            columns = tuple(
+                column
+                for column in columns
+                if cast(tuple[object, ...], column)[0] != "timestamp_authoritative"
+            )
         migrated.append((table_name, columns, indexes, foreign_keys))
     return tuple(migrated)
+
+
+@lru_cache
+def _expected_migrated_v3_schema_contract(
+    source_version: int, migrated_v2: bool = False
+) -> SchemaContract:
+    """Accept only the deterministic ALTER TABLE layouts emitted by migrations."""
+    if source_version == 1:
+        tables = list(_expected_v1_schema_contract())
+        final_quality = next(
+            table for table in _expected_v3_schema_contract() if table[0] == "quality_decisions"
+        )
+        tables.append(final_quality)
+    elif source_version == 2:
+        tables = list(_expected_v2_schema_contract(migrated_from_v1=migrated_v2))
+    else:
+        raise ValueError("unsupported migration source version")
+    final = _expected_v3_schema_contract()
+    final_normalized = cast(
+        tuple[str, tuple[tuple[object, ...], ...], tuple[object, ...], tuple[object, ...]],
+        next(table for table in final if cast(str, table[0]) == "normalized_snapshots"),
+    )
+    final_quotes = cast(
+        tuple[str, tuple[tuple[object, ...], ...], tuple[object, ...], tuple[object, ...]],
+        next(table for table in final if cast(str, table[0]) == "option_quotes"),
+    )
+    source_column = next(
+        column for column in final_normalized[1] if column[0] == "source_time_authoritative"
+    )
+    serialization_column = next(
+        column for column in final_normalized[1] if column[0] == "serialization_version"
+    )
+    quote_authority_column = next(
+        column for column in final_quotes[1] if column[0] == "timestamp_authoritative"
+    )
+    transformed: list[
+        tuple[str, tuple[object, ...], tuple[object, ...], tuple[object, ...]]
+    ] = []
+    for table_name, columns, indexes, foreign_keys in tables:
+        if table_name == "normalized_snapshots":
+            if source_version == 1:
+                columns += ((*source_column[:-1], "0"),)
+            serialization_default = "1" if source_version == 1 else "2"
+            columns += ((*serialization_column[:-1], serialization_default),)
+        if table_name == "option_quotes":
+            columns += ((*quote_authority_column[:-1], "0"),)
+        transformed.append((table_name, columns, indexes, foreign_keys))
+    return tuple(sorted(transformed, key=lambda table: table[0]))
 
 
 def _expected_schema_contract(schema: MetaData) -> SchemaContract:
@@ -278,7 +351,7 @@ class SnapshotRepository:
         report: DataQualityReport,
         *,
         baseline: bool,
-    ) -> None:
+    ) -> DataQualityReport:
         """Atomically publish normalized data, exactly one audit, and baseline state."""
         self.read_raw(snapshot_id)
         with self._write_lock() as connection:
@@ -286,12 +359,15 @@ class SnapshotRepository:
                 connection, snapshot_id, snapshot
             )
             if self._has_quality_decision(connection, normalized_id):
-                raise RuntimeError("normalized snapshot already has a quality decision")
+                # Exact re-observation is idempotent: retain the original audit
+                # and never move a baseline backwards.
+                return self._stored_quality_report(connection, normalized_id)
             self._insert_quality_decision_locked(connection, normalized_id, report)
             if baseline:
                 self._update_baseline_locked(
                     connection, snapshot.instrument, normalized_id, report.checked_at
                 )
+            return report
 
     def _publish_normalized_locked(
         self,
@@ -301,9 +377,15 @@ class SnapshotRepository:
     ) -> int:
         """Write Parquet and its indexes while the caller owns the writer transaction."""
         canonical = canonical_snapshot(snapshot)
-        content_sha256 = snapshot_content_sha256(canonical)
+        serialization_version = 3
+        content_sha256 = snapshot_content_sha256(
+            canonical, serialization_version=serialization_version
+        )
         expected_path = self._parquet._relative_path(
-            snapshot_id, canonical, canonical.source_timestamp.date()
+            snapshot_id,
+            canonical,
+            canonical.source_timestamp.date(),
+            serialization_version=serialization_version,
         )
         existing = self._normalized_record(connection, snapshot_id, content_sha256)
         if existing is not None:
@@ -314,7 +396,9 @@ class SnapshotRepository:
 
         published = False
         try:
-            relative_path = self._parquet.write(snapshot_id, canonical)
+            relative_path = self._parquet.write(
+                snapshot_id, canonical, serialization_version=serialization_version
+            )
             if relative_path != expected_path:
                 raise RuntimeError("Parquet writer produced an unexpected partition path")
             published = True
@@ -330,6 +414,7 @@ class SnapshotRepository:
                     spot=canonical.spot,
                     expiry=canonical.expiry,
                     source_time_authoritative=canonical.source_time_authoritative,
+                    serialization_version=serialization_version,
                     parquet_path=relative_path.as_posix(),
                 )
                 .returning(normalized_snapshots.c.id)
@@ -342,6 +427,7 @@ class SnapshotRepository:
                         "normalized_snapshot_id": normalized_id,
                         "ordinal": ordinal,
                         "timestamp": quote.timestamp,
+                        "timestamp_authoritative": quote.timestamp_authoritative,
                         "strike": quote.strike,
                         "option_type": quote.option_type,
                         "expiry": quote.expiry,
@@ -373,6 +459,38 @@ class SnapshotRepository:
                 )
             ).scalar_one_or_none()
             is not None
+        )
+
+    @staticmethod
+    def _stored_quality_report(
+        connection: Connection, normalized_id: int
+    ) -> DataQualityReport:
+        rows = list(
+            connection.execute(
+                select(
+                    quality_decisions.c.tradable,
+                    quality_decisions.c.codes,
+                    quality_decisions.c.details,
+                ).where(quality_decisions.c.normalized_snapshot_id == normalized_id)
+            ).mappings()
+        )
+        if len(rows) != 1:
+            raise RuntimeError("normalized snapshot has inconsistent quality decisions")
+        checked_at = connection.execute(
+            select(quality_decisions.c.checked_at).where(
+                quality_decisions.c.normalized_snapshot_id == normalized_id
+            )
+        ).scalar_one()
+        recorded_codes = rows[0]["codes"]
+        if not isinstance(recorded_codes, list) or not isinstance(
+            rows[0]["details"], dict
+        ):
+            raise RuntimeError("normalized snapshot has invalid quality decision")
+        return DataQualityReport(
+            tradable=bool(rows[0]["tradable"]),
+            codes=tuple(DataQualityCode(code) for code in recorded_codes),
+            checked_at=cast(datetime, checked_at),
+            details=cast(dict[str, str], rows[0]["details"]),
         )
 
     @staticmethod
@@ -439,7 +557,10 @@ class SnapshotRepository:
                 )
                 relative_path = self._validated_index_path(typed_row, snapshot)
                 self._parquet.verify(
-                    relative_path, cast(str, typed_row["raw_snapshot_id"]), snapshot
+                    relative_path,
+                    cast(str, typed_row["raw_snapshot_id"]),
+                    snapshot,
+                    serialization_version=self._serialization_version(typed_row),
                 )
                 yield snapshot
 
@@ -483,7 +604,10 @@ class SnapshotRepository:
                 )
                 relative_path = self._validated_index_path(typed_row, snapshot)
                 self._parquet.verify(
-                    relative_path, cast(str, typed_row["raw_snapshot_id"]), snapshot
+                    relative_path,
+                    cast(str, typed_row["raw_snapshot_id"]),
+                    snapshot,
+                    serialization_version=self._serialization_version(typed_row),
                 )
                 yield snapshot
 
@@ -497,7 +621,7 @@ class SnapshotRepository:
     ) -> None:
         """Compatibility path that replaces only an explicit pending assessment."""
         canonical = canonical_snapshot(snapshot)
-        content_sha256 = snapshot_content_sha256(canonical)
+        content_sha256 = snapshot_content_sha256(canonical, serialization_version=3)
         with self._write_lock() as connection:
             record = self._normalized_record(connection, snapshot_id, content_sha256)
             if record is None:
@@ -568,7 +692,10 @@ class SnapshotRepository:
             )
             relative_path = self._validated_index_path(row, snapshot)
             self._parquet.verify(
-                relative_path, cast(str, row["raw_snapshot_id"]), snapshot
+                relative_path,
+                cast(str, row["raw_snapshot_id"]),
+                snapshot,
+                serialization_version=self._serialization_version(row),
             )
             return snapshot
 
@@ -635,7 +762,7 @@ class SnapshotRepository:
     def _initialize_and_recover(self) -> None:
         if self._database_existed:
             with self._write_lock() as connection:
-                self._migrate_v1_if_needed(connection)
+                self._migrate_schema_if_needed(connection)
                 self._assert_supported_existing_database(connection)
                 self._backfill_missing_quality_locked(connection)
                 self._recover_orphaned_parquet_locked(connection)
@@ -649,7 +776,7 @@ class SnapshotRepository:
                 raise RuntimeError("SQLite WAL mode could not be enabled")
         with self._write_lock() as connection:
             if self._user_table_names(connection):
-                self._migrate_v1_if_needed(connection)
+                self._migrate_schema_if_needed(connection)
                 self._assert_supported_existing_database(connection)
             else:
                 metadata.create_all(connection)
@@ -686,31 +813,61 @@ class SnapshotRepository:
         if str(journal_mode).lower() != "wal":
             raise RuntimeError("unsupported existing database journal mode")
         if _schema_contract(connection) not in {
-            _expected_v2_schema_contract(),
-            _expected_migrated_v2_schema_contract(),
+            _expected_v3_schema_contract(),
+            _expected_migrated_v3_schema_contract(1),
+            _expected_migrated_v3_schema_contract(2),
+            _expected_migrated_v3_schema_contract(2, migrated_v2=True),
         }:
             raise RuntimeError("unsupported existing database schema")
 
-    def _migrate_v1_if_needed(self, connection: Connection) -> None:
-        """Upgrade only the exact known v1 contract inside the existing writer lock."""
+    def _migrate_schema_if_needed(self, connection: Connection) -> None:
+        """Upgrade only exact historical layouts inside the existing writer lock."""
         if "schema_versions" not in self._user_table_names(connection):
             return
         versions = list(connection.execute(select(schema_versions.c.version)).scalars())
-        if versions != [1]:
+        if versions == [SCHEMA_VERSION]:
             return
-        if (
-            _schema_contract(connection, table_names=self._user_table_names(connection))
-            != _expected_v1_schema_contract()
-        ):
-            raise RuntimeError("unsupported existing database schema")
-        connection.exec_driver_sql(
-            "ALTER TABLE normalized_snapshots "
-            "ADD COLUMN source_time_authoritative BOOLEAN NOT NULL DEFAULT 0"
-        )
-        quality_decisions.create(connection)
-        self._backfill_missing_quality_locked(
-            connection, code=DataQualityCode.MIGRATED_UNASSESSED
-        )
+        if versions == [1]:
+            if (
+                _schema_contract(connection, table_names=self._user_table_names(connection))
+                != _expected_v1_schema_contract()
+            ):
+                raise RuntimeError("unsupported existing database schema")
+            connection.exec_driver_sql(
+                "ALTER TABLE normalized_snapshots "
+                "ADD COLUMN source_time_authoritative BOOLEAN NOT NULL DEFAULT 0"
+            )
+            quality_decisions.create(connection)
+            connection.exec_driver_sql(
+                "ALTER TABLE option_quotes "
+                "ADD COLUMN timestamp_authoritative BOOLEAN NOT NULL DEFAULT 0"
+            )
+            connection.exec_driver_sql(
+                "ALTER TABLE normalized_snapshots "
+                "ADD COLUMN serialization_version INTEGER NOT NULL DEFAULT 1"
+            )
+            self._backfill_missing_quality_locked(
+                connection, code=DataQualityCode.MIGRATED_UNASSESSED
+            )
+        elif versions == [2]:
+            contract = _schema_contract(
+                connection, table_names=self._user_table_names(connection)
+            )
+            if contract not in {
+                _expected_v2_schema_contract(),
+                _expected_v2_schema_contract(migrated_from_v1=True),
+            }:
+                raise RuntimeError("unsupported existing database schema")
+            connection.exec_driver_sql(
+                "ALTER TABLE option_quotes "
+                "ADD COLUMN timestamp_authoritative BOOLEAN NOT NULL DEFAULT 0"
+            )
+            connection.exec_driver_sql(
+                "ALTER TABLE normalized_snapshots "
+                "ADD COLUMN serialization_version INTEGER NOT NULL DEFAULT 2"
+            )
+        else:
+            raise RuntimeError("unsupported existing database schema version")
         connection.execute(delete(schema_versions))
         connection.execute(
             insert(schema_versions).values(
@@ -786,16 +943,25 @@ class SnapshotRepository:
         snapshot: OptionChainSnapshot,
         expected_path: Path,
     ) -> None:
+        serialization_version = self._serialization_version(row)
         if (
             row["instrument"] != snapshot.instrument
             or row["session_date"] != snapshot.source_timestamp.date()
-            or row["content_sha256"] != snapshot_content_sha256(snapshot)
+            or row["content_sha256"]
+            != snapshot_content_sha256(
+                snapshot, serialization_version=serialization_version
+            )
         ):
             raise RuntimeError("normalized snapshot index is inconsistent")
         actual_path = self._safe_relative_path(cast(str, row["parquet_path"]))
         if actual_path != expected_path:
             raise RuntimeError("normalized snapshot index is inconsistent")
-        self._parquet.verify(actual_path, snapshot_id, snapshot)
+        self._parquet.verify(
+            actual_path,
+            snapshot_id,
+            snapshot,
+            serialization_version=serialization_version,
+        )
 
     def _validated_index_path(
         self, row: Mapping[str, Any], snapshot: OptionChainSnapshot
@@ -803,23 +969,35 @@ class SnapshotRepository:
         try:
             indexed_instrument = cast(str, row["instrument"])
             indexed_date = cast(date, row["session_date"])
+            serialization_version = self._serialization_version(row)
             expected_path = self._parquet._relative_path(
                 cast(str, row["raw_snapshot_id"]),
                 snapshot,
                 snapshot.source_timestamp.date(),
+                serialization_version=serialization_version,
             )
         except (TypeError, ValueError) as error:
             raise RuntimeError("normalized snapshot index is inconsistent") from error
         if (
             indexed_instrument != snapshot.instrument
             or indexed_date != snapshot.source_timestamp.date()
-            or row["content_sha256"] != snapshot_content_sha256(snapshot)
+            or row["content_sha256"]
+            != snapshot_content_sha256(
+                snapshot, serialization_version=serialization_version
+            )
         ):
             raise RuntimeError("normalized snapshot index is inconsistent")
         actual_path = self._safe_relative_path(cast(str, row["parquet_path"]))
         if actual_path != expected_path:
             raise RuntimeError("normalized snapshot index is inconsistent")
         return actual_path
+
+    @staticmethod
+    def _serialization_version(row: Mapping[str, Any]) -> int:
+        value = row.get("serialization_version")
+        if not isinstance(value, int) or value not in {1, 2, 3}:
+            raise RuntimeError("normalized snapshot serialization is inconsistent")
+        return value
 
     def _safe_relative_path(self, path_text: str) -> Path:
         """Accept only a contained, non-traversing relative path beneath parquet_root."""
@@ -872,12 +1050,12 @@ class SnapshotRepository:
             source_time_authoritative = cast(
                 bool, row["source_time_authoritative"]
             )
-            # The option-chain normalizer gives every quote the snapshot source
-            # provenance; retain that explicit contract on replay without
-            # treating local placeholders as authoritative.
             quotes = tuple(
                 self._quote_from_row(
-                    quote_row, timestamp_authoritative=source_time_authoritative
+                    quote_row,
+                    timestamp_authoritative=cast(
+                        bool, quote_row["timestamp_authoritative"]
+                    ),
                 )
                 for quote_row in quote_rows
             )

@@ -160,3 +160,35 @@ def test_importing_cli_creates_no_data_directory_or_network_work(tmp_path: Path)
     assert completed.stdout == ""
     assert completed.stderr == ""
     assert not (tmp_path / ".nifty-signal-data").exists()
+
+
+def test_fixture_collection_is_idempotent_for_count_and_repeated_invocation(
+    tmp_path: Path,
+) -> None:
+    """A re-observed immutable fixture must not fail because it already has an audit."""
+    data_dir = tmp_path / "data"
+    command = [
+        sys.executable,
+        "-m",
+        "nifty_signal_engine.cli",
+        "collect",
+        "--fixture",
+        str(FIXTURE),
+        "--instrument",
+        "NIFTY",
+        "--count",
+        "2",
+        "--interval-seconds",
+        "0",
+        "--data-dir",
+        str(data_dir),
+    ]
+
+    first = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=True)
+    second = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=True)
+
+    assert len(first.stdout.splitlines()) == 2
+    assert all(
+        json.loads(line)["status"] == "COLLECTED"
+        for line in second.stdout.splitlines()
+    )
