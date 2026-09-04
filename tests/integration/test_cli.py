@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import subprocess
 import sys
 from datetime import date
@@ -147,7 +148,9 @@ def test_fixture_metadata_controls_capture_source_expiry_and_calendar_without_wa
     assert snapshots[0].source_time_authoritative is True
 
 
-def test_importing_cli_creates_no_data_directory_or_network_work(tmp_path: Path) -> None:
+def test_importing_cli_creates_no_data_directory_or_network_work(
+    tmp_path: Path,
+) -> None:
     """Moving collection into import-time code must not alter a caller's working directory."""
     completed = subprocess.run(
         [sys.executable, "-c", "import nifty_signal_engine.cli"],
@@ -184,11 +187,36 @@ def test_fixture_collection_is_idempotent_for_count_and_repeated_invocation(
         str(data_dir),
     ]
 
-    first = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=True)
-    second = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=True)
+    first = subprocess.run(
+        command, cwd=ROOT, capture_output=True, text=True, check=True
+    )
+    second = subprocess.run(
+        command, cwd=ROOT, capture_output=True, text=True, check=True
+    )
 
     assert len(first.stdout.splitlines()) == 2
     assert all(
-        json.loads(line)["status"] == "COLLECTED"
-        for line in second.stdout.splitlines()
+        json.loads(line)["status"] == "COLLECTED" for line in second.stdout.splitlines()
     )
+    results = [
+        json.loads(line)
+        for line in (*first.stdout.splitlines(), *second.stdout.splitlines())
+    ]
+    assert all(result["tradable"] is False for result in results)
+    for result in results[1:]:
+        assert "DUPLICATE_OBSERVATION" in result["quality_codes"]
+        assert result["quality_checked_at"] == "2026-08-30T10:00:01+05:30"
+        assert result["quality_details"]["decision_scope"] == "duplicate_observation"
+        assert result["quality_details"]["historical_quality_decision_id"] == "1"
+    assert results[1] == results[2] == results[3]
+    with sqlite3.connect(data_dir / "market.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM normalized_snapshots"
+        ).fetchone() == (1,)
+        assert connection.execute("SELECT COUNT(*) FROM raw_snapshots").fetchone() == (
+            1,
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM quality_decisions").fetchone()[0]
+            >= 2
+        )

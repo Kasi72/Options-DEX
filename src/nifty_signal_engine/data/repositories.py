@@ -46,6 +46,14 @@ from nifty_signal_engine.monitoring.data_quality import (
 
 IST: Final = ZoneInfo("Asia/Kolkata")
 SnapshotId = NewType("SnapshotId", str)
+# Legacy and first-publication audits have no scope marker. Duplicate observations
+# are append-only rows, never candidates for historical replay or baseline state.
+_HISTORICAL_QUALITY = (
+    quality_decisions.c.details["decision_scope"].as_string().is_(None)
+)
+_OBSERVATION_DETAIL_KEYS = frozenset(
+    {"decision_scope", "historical_quality_decision_id"}
+)
 SchemaContract = tuple[
     tuple[str, tuple[object, ...], tuple[object, ...], tuple[object, ...]], ...
 ]
@@ -352,16 +360,41 @@ class SnapshotRepository:
         *,
         baseline: bool,
     ) -> DataQualityReport:
-        """Atomically publish normalized data, exactly one audit, and baseline state."""
+        """Persist and return current quality, preserving the first historical audit.
+
+        Exact normalized duplicates get a separate fail-closed observation audit
+        referencing the original decision; they never advance or rewind baseline
+        state. Historical replay/summary APIs select only the original decision.
+        """
+        self._validate_quality_details(report)
         self.read_raw(snapshot_id)
         with self._write_lock() as connection:
             normalized_id = self._publish_normalized_locked(
                 connection, snapshot_id, snapshot
             )
             if self._has_quality_decision(connection, normalized_id):
-                # Exact re-observation is idempotent: retain the original audit
-                # and never move a baseline backwards.
-                return self._stored_quality_report(connection, normalized_id)
+                historical_id, _ = self._stored_quality_decision(
+                    connection, normalized_id
+                )
+                observation = report.model_copy(
+                    update={
+                        "tradable": False,
+                        "codes": tuple(
+                            dict.fromkeys(
+                                (*report.codes, DataQualityCode.DUPLICATE_OBSERVATION)
+                            )
+                        ),
+                        "details": {
+                            **report.details,
+                            "decision_scope": "duplicate_observation",
+                            "historical_quality_decision_id": str(historical_id),
+                        },
+                    }
+                )
+                self._insert_quality_decision_locked(
+                    connection, normalized_id, observation
+                )
+                return observation
             self._insert_quality_decision_locked(connection, normalized_id, report)
             if baseline:
                 self._update_baseline_locked(
@@ -452,46 +485,64 @@ class SnapshotRepository:
 
     @staticmethod
     def _has_quality_decision(connection: Connection, normalized_id: int) -> bool:
-        return (
-            connection.execute(
-                select(quality_decisions.c.id).where(
-                    quality_decisions.c.normalized_snapshot_id == normalized_id
-                )
-            ).scalar_one_or_none()
-            is not None
-        )
+        historical_id = connection.execute(
+            select(quality_decisions.c.id).where(
+                quality_decisions.c.normalized_snapshot_id == normalized_id,
+                _HISTORICAL_QUALITY,
+            )
+        ).scalar_one_or_none()
+        if historical_id is not None:
+            return True
+        observation = connection.execute(
+            select(quality_decisions.c.id)
+            .where(quality_decisions.c.normalized_snapshot_id == normalized_id)
+            .limit(1)
+        ).scalar_one_or_none()
+        if observation is not None:
+            raise RuntimeError(
+                "normalized snapshot is missing its historical quality decision"
+            )
+        return False
 
     @staticmethod
-    def _stored_quality_report(
+    def _stored_quality_decision(
         connection: Connection, normalized_id: int
-    ) -> DataQualityReport:
+    ) -> tuple[int, DataQualityReport]:
         rows = list(
             connection.execute(
                 select(
+                    quality_decisions.c.id,
+                    quality_decisions.c.checked_at,
                     quality_decisions.c.tradable,
                     quality_decisions.c.codes,
                     quality_decisions.c.details,
-                ).where(quality_decisions.c.normalized_snapshot_id == normalized_id)
+                ).where(
+                    quality_decisions.c.normalized_snapshot_id == normalized_id,
+                    _HISTORICAL_QUALITY,
+                )
             ).mappings()
         )
         if len(rows) != 1:
             raise RuntimeError("normalized snapshot has inconsistent quality decisions")
-        checked_at = connection.execute(
-            select(quality_decisions.c.checked_at).where(
-                quality_decisions.c.normalized_snapshot_id == normalized_id
-            )
-        ).scalar_one()
         recorded_codes = rows[0]["codes"]
-        if not isinstance(recorded_codes, list) or not isinstance(
+        valid_audit_shape = isinstance(recorded_codes, list) and isinstance(
             rows[0]["details"], dict
-        ):
+        )
+        if not valid_audit_shape:
             raise RuntimeError("normalized snapshot has invalid quality decision")
-        return DataQualityReport(
+        return cast(int, rows[0]["id"]), DataQualityReport(
             tradable=bool(rows[0]["tradable"]),
             codes=tuple(DataQualityCode(code) for code in recorded_codes),
-            checked_at=cast(datetime, checked_at),
+            checked_at=cast(datetime, rows[0]["checked_at"]),
             details=cast(dict[str, str], rows[0]["details"]),
         )
+
+    @staticmethod
+    def _validate_quality_details(report: DataQualityReport) -> None:
+        if _OBSERVATION_DETAIL_KEYS.intersection(report.details):
+            raise ValueError(
+                "quality details contain repository-reserved observation fields"
+            )
 
     @staticmethod
     def _insert_quality_decision_locked(
@@ -567,14 +618,15 @@ class SnapshotRepository:
     def iter_tradable_session(
         self, instrument: str, session_date: date
     ) -> Iterator[OptionChainSnapshot]:
-        """Yield only snapshots with an explicit positive audit decision."""
+        """Yield historical positive first-publication decisions, not live permissions."""
         if instrument not in {"NIFTY", "BANKNIFTY"}:
             raise ValueError(f"unsupported instrument: {instrument}")
         with self._engine.connect() as connection:
             tradable_ids = set(
                 connection.execute(
                     select(quality_decisions.c.normalized_snapshot_id).where(
-                        quality_decisions.c.tradable.is_(True)
+                        quality_decisions.c.tradable.is_(True),
+                        _HISTORICAL_QUALITY,
                     )
                 ).scalars()
             )
@@ -620,6 +672,7 @@ class SnapshotRepository:
         baseline: bool,
     ) -> None:
         """Compatibility path that replaces only an explicit pending assessment."""
+        self._validate_quality_details(report)
         canonical = canonical_snapshot(snapshot)
         content_sha256 = snapshot_content_sha256(canonical, serialization_version=3)
         with self._write_lock() as connection:
@@ -702,7 +755,7 @@ class SnapshotRepository:
     def session_quality_summary(
         self, instrument: str, selected_date: date
     ) -> dict[str, object]:
-        """Return audit counts for inspection without exposing raw payloads or credentials."""
+        """Count historical first-publication audits, excluding duplicate observations."""
         with self._engine.connect() as connection:
             snapshot_ids = list(
                 connection.execute(
@@ -716,7 +769,8 @@ class SnapshotRepository:
                 return {"snapshot_count": 0, "tradable_count": 0, "codes": {}}
             decisions = connection.execute(
                 select(quality_decisions.c.tradable, quality_decisions.c.codes).where(
-                    quality_decisions.c.normalized_snapshot_id.in_(snapshot_ids)
+                    quality_decisions.c.normalized_snapshot_id.in_(snapshot_ids),
+                    _HISTORICAL_QUALITY,
                 )
             )
             tradable_count = 0
@@ -733,7 +787,10 @@ class SnapshotRepository:
                 list(
                     connection.execute(
                         select(quality_decisions.c.id).where(
-                            quality_decisions.c.normalized_snapshot_id.in_(snapshot_ids)
+                            quality_decisions.c.normalized_snapshot_id.in_(
+                                snapshot_ids
+                            ),
+                            _HISTORICAL_QUALITY,
                         )
                     ).scalars()
                 )

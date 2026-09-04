@@ -47,6 +47,66 @@ def test_raw_snapshot_is_content_addressed_and_immutable(
     assert repository.read_raw(first) == raw_payload
 
 
+def test_duplicate_audit_never_rolls_back_baseline_or_replaces_missing_history(
+    repository: SnapshotRepository,
+) -> None:
+    """Duplicate rows cannot replace either a newer baseline or a lost original audit."""
+    raw_id = repository.save_raw(b"duplicate-audit")
+    first = make_chain(timestamp="2026-08-28T10:00:00+05:30")
+    later = make_chain(timestamp="2026-08-28T10:01:00+05:30")
+    report = DataQualityReport(tradable=True, codes=(), checked_at=first.received_at)
+    repository.publish_normalized_with_quality_and_baseline(
+        raw_id, first, report, baseline=True
+    )
+    repository.publish_normalized_with_quality_and_baseline(
+        raw_id,
+        later,
+        report.model_copy(update={"checked_at": later.received_at}),
+        baseline=True,
+    )
+    duplicate = repository.publish_normalized_with_quality_and_baseline(
+        raw_id,
+        first,
+        report.model_copy(update={"checked_at": later.received_at}),
+        baseline=True,
+    )
+    assert duplicate.tradable is False
+    assert repository.load_collector_baseline("NIFTY") == later
+    with sqlite3.connect(repository.database_path) as connection:
+        connection.execute("DELETE FROM quality_decisions WHERE id = 1")
+    assert list(repository.iter_tradable_session("NIFTY", date(2026, 8, 28))) == [later]
+    assert repository.session_quality_summary("NIFTY", date(2026, 8, 28)) == {
+        "snapshot_count": 2,
+        "tradable_count": 1,
+        "codes": {"QUALITY_MISSING": 1},
+    }
+    with pytest.raises(RuntimeError, match="historical quality decision"):
+        repository.publish_normalized_with_quality_and_baseline(
+            raw_id, first, report, baseline=True
+        )
+
+
+@pytest.mark.parametrize("key", ["decision_scope", "historical_quality_decision_id"])
+def test_caller_cannot_forge_repository_observation_scope(
+    repository: SnapshotRepository,
+    key: str,
+) -> None:
+    """Assessor details cannot masquerade as repository-controlled historical links."""
+    raw_id = repository.save_raw(b"reserved-fields")
+    snapshot = make_chain(timestamp="2026-08-28T10:00:00+05:30")
+    report = DataQualityReport(
+        tradable=True,
+        codes=(),
+        checked_at=snapshot.received_at,
+        details={key: "forged"},
+    )
+    with pytest.raises(ValueError, match="repository-reserved"):
+        repository.publish_normalized_with_quality_and_baseline(
+            raw_id, snapshot, report, baseline=True
+        )
+    assert list(repository.iter_session("NIFTY", date(2026, 8, 28))) == []
+
+
 def test_schema_uses_wal_and_records_current_version(
     repository: SnapshotRepository,
 ) -> None:
@@ -727,11 +787,15 @@ def test_exact_v2_database_gets_a_versioned_quote_provenance_migration(
         connection.commit()
 
     with (
-        SnapshotRepository(database_path=database_path, parquet_root=parquet_root) as repository,
+        SnapshotRepository(
+            database_path=database_path, parquet_root=parquet_root
+        ) as repository,
         sqlite3.connect(repository.database_path) as connection,
     ):
         version = connection.execute("SELECT version FROM schema_versions").fetchall()
-        quote_columns = connection.execute("PRAGMA table_info(option_quotes)").fetchall()
+        quote_columns = connection.execute(
+            "PRAGMA table_info(option_quotes)"
+        ).fetchall()
         snapshot_columns = connection.execute(
             "PRAGMA table_info(normalized_snapshots)"
         ).fetchall()

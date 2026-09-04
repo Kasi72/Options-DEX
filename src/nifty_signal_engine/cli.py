@@ -184,6 +184,10 @@ def _result_payload(result: CollectionResult) -> dict[str, object]:
         "quality_codes": [str(code) for code in quality.codes]
         if quality is not None
         else [],
+        "quality_checked_at": quality.checked_at.isoformat()
+        if quality is not None
+        else None,
+        "quality_details": quality.details if quality is not None else {},
         "error_type": result.error_type,
         "active_expiries": [expiry.isoformat() for expiry in result.active_expiries],
         "selected_expiry": (

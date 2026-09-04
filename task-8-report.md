@@ -102,3 +102,33 @@ The supplied sanitized fixture is dated on a weekend and has only one paired str
 - Exact duplicate reobservations reuse their existing immutable normalized artifact and audit decision without appending an audit or moving collector state backward. Content-distinct observations remain separate immutable snapshots.
 
 Round-3 RED/GREEN coverage includes delayed assessment, mixed source/quote provenance roundtrip, genuine v1-format Parquet replay after restart, v2-to-v3 migration, and repeated fixture collection. Verification: `py -m pytest tests/unit tests/integration -q` — 148 passed; `py -m ruff check src tests` and `py -m mypy src` passed. No live request, order, or credential output was used.
+
+## Critical correction round 4 — current observation versus historical audit
+
+### Root cause and semantics
+
+- Supersedes round 3's duplicate-audit-return behavior: collection freshly assessed a duplicate at the current clock, but the repository discarded that assessment and returned the original historical report. A once-tradable snapshot therefore remained tradable in the returned current result after freshness expired.
+- `CollectionResult.quality` now always describes the current observation. Duplicate normalized content produces a persisted, fail-closed `DUPLICATE_OBSERVATION` decision retaining the current `checked_at`, assessment codes (including stale source/receipt and equal/out-of-order timestamps), and details. Assessor exceptions likewise retain their current failure code and time.
+- Duplicate decisions are appended to the existing `quality_decisions` table and linked by its existing normalized-snapshot foreign key. Repository-controlled details label `decision_scope: duplicate_observation` and reference the stable `historical_quality_decision_id`; callers cannot forge those reserved fields. Every duplicate invocation is audited, even when its deterministic report is identical to an earlier invocation.
+- The first-publication audit remains immutable and is selected explicitly by historical replay/summary APIs. Historical tradability is a replay property, never a current permission. Observation rows cannot inflate historical counts or replace a missing original audit. No schema migration is needed: the existing version-3 audit table already supports multiple rows per normalized snapshot, so exact v1/v2/v3 schema compatibility is unchanged.
+- Raw bytes and normalized/Parquet content remain idempotent. Duplicate publication never changes persisted baseline state, and collector in-memory state now honors that same rule even with an injected permissive assessor.
+- CLI output includes `quality_checked_at` and `quality_details`, exposing the current decision's time and durable historical reference rather than hiding them behind a `COLLECTED` status.
+
+### TDD evidence
+
+- RED: `py -m pytest tests/integration/test_collector.py -k duplicate -q` — 3 failed, 12 deselected. The real quality assessor first established a trusted baseline and a fully tradable snapshot; equal-time (`10:00:01`), fresh (`10:00:10`), and stale (`10:01:00`) reobservations all incorrectly returned `tradable=True` from the original `10:00:01` audit.
+- GREEN: the same command — 3 passed, 12 deselected. The stale case retains `STALE_SOURCE`, `STALE_RECEIPT`, a 60-second source age, and the current checked time. Reopening verifies persisted duplicate decisions, unchanged original audits and baseline, unchanged Parquet bytes, and exactly two historical snapshots with only the original positive decision replayable.
+- Additional RED: repeated CLI test failed on missing `quality_checked_at`; missing-original-audit test failed because publication silently recreated an original audit despite surviving observation rows. Both pass after the corresponding corrections.
+- Covering tests also exercise repository-owned audit fields, a newer persisted baseline, collector in-memory baseline protection with a permissive assessor, current assessment exceptions on duplicates, deterministic repeated CLI output, and the existing legacy-schema migrations.
+
+### Final verification
+
+- `py -m pytest tests/integration/test_collector.py tests/integration/test_repositories.py tests/integration/test_cli.py -q` — 52 passed.
+- `py -m pytest tests/unit tests/integration -q` — 156 passed.
+- `py -m ruff check src/nifty_signal_engine/data/collector.py src/nifty_signal_engine/data/repositories.py src/nifty_signal_engine/monitoring/data_quality.py src/nifty_signal_engine/cli.py tests/integration/test_collector.py tests/integration/test_repositories.py tests/integration/test_cli.py` — All checks passed; no command-line rule ignores. Two existing touched-path lint findings were corrected without suppression.
+- `py -m mypy src` — Success: no issues found in 24 source files.
+- `git diff --check` — no whitespace errors (Git reported only configured LF-to-CRLF working-copy conversion warnings).
+
+### Scope and concerns
+
+No live network calls, orders, secrets, original reference-file edits, or schema changes. The intentional append-only observation history grows with collection attempts; normalized artifacts remain deduplicated. No remaining concern for this finding.

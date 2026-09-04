@@ -50,6 +50,8 @@ class CollectionStatus(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class CollectionResult:
+    """Current observation outcome; quality is never a historical replay permission."""
+
     instrument: Instrument
     status: CollectionStatus
     raw_snapshot_id: SnapshotId | None
@@ -194,7 +196,7 @@ class Collector:
             quality = quality.model_copy(
                 update={
                     "tradable": False,
-                    "codes": tuple((*quality.codes, DataQualityCode.BASELINE_CORRUPT)),
+                    "codes": (*quality.codes, DataQualityCode.BASELINE_CORRUPT),
                     "details": {**quality.details, "baseline": "repository_corrupt"},
                 }
             )
@@ -204,7 +206,7 @@ class Collector:
         quality = self._repository.publish_normalized_with_quality_and_baseline(
             raw_snapshot_id, snapshot, quality, baseline=baseline
         )
-        if baseline:
+        if baseline and DataQualityCode.DUPLICATE_OBSERVATION not in quality.codes:
             self._previous[instrument] = snapshot
         return CollectionResult(
             instrument=instrument,

@@ -1,9 +1,11 @@
 import asyncio
+import json
 import sqlite3
 from datetime import date
 from pathlib import Path
 
 import httpx
+import pytest
 
 from nifty_signal_engine.data.collector import CollectionStatus, Collector
 from nifty_signal_engine.data.dhan_client import BrokerPayloadError, RawSnapshot
@@ -12,10 +14,124 @@ from nifty_signal_engine.data.repositories import SnapshotRepository
 from nifty_signal_engine.monitoring.data_quality import (
     DataQualityCode,
     DataQualityReport,
+    QualityConfig,
+    TradingCalendar,
 )
 from tests.factories import aware, make_chain
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
+
+
+@pytest.mark.parametrize("rechecked_at", ["10:00:01", "10:00:10", "10:01:00"])
+def test_duplicate_returns_durable_current_quality_not_historical_permission(
+    tmp_path: Path,
+    rechecked_at: str,
+) -> None:
+    """Reusing a formerly tradable audit must not authorize a duplicate observation."""
+    database_path = tmp_path / "market.sqlite3"
+    parquet_root = tmp_path / "parquet"
+    snapshots = []
+    for timestamp in ("09:59:50", "10:00:00"):
+        snapshot = make_chain(
+            timestamp=f"2026-08-28T{timestamp}+05:30",
+            call_volume=100,
+            put_volume=100,
+        )
+        snapshots.append(
+            snapshot.model_copy(
+                update={
+                    "source_time_authoritative": True,
+                    "quotes": tuple(
+                        quote.model_copy(
+                            update={
+                                "timestamp_authoritative": True,
+                                "api_delta": 0.5,
+                                "api_gamma": 0.01,
+                            }
+                        )
+                        for quote in snapshot.quotes
+                    ),
+                }
+            )
+        )
+    now = aware("2026-08-28T10:00:01+05:30")
+    current = snapshots[0]
+    with SnapshotRepository(
+        database_path=database_path, parquet_root=parquet_root
+    ) as repository:
+        collector = Collector(
+            broker=_Broker(_raw()),
+            repository=repository,
+            normalizer=lambda *_args: current,
+            clock=lambda: now,
+            calendar=TradingCalendar({date(2026, 8, 28)}),
+            quality_config=QualityConfig(minimum_paired_strikes=1),
+        )
+        asyncio.run(collector.collect_once("NIFTY"))
+        current = snapshots[1]
+        first = asyncio.run(collector.collect_once("NIFTY"))
+        assert first.quality is not None and first.quality.tradable is True
+        with sqlite3.connect(database_path) as connection:
+            original_audits = connection.execute(
+                "SELECT * FROM quality_decisions ORDER BY id"
+            ).fetchall()
+            original_state = connection.execute(
+                "SELECT * FROM collector_state"
+            ).fetchall()
+        parquet_before = {
+            path: path.read_bytes() for path in parquet_root.rglob("*.parquet")
+        }
+        now = aware(f"2026-08-28T{rechecked_at}+05:30")
+        duplicate = asyncio.run(collector.collect_once("NIFTY"))
+        assert duplicate.status is CollectionStatus.COLLECTED
+        assert duplicate.quality is not None
+        assert duplicate.quality.tradable is False
+        assert duplicate.quality.checked_at == now
+        assert "DUPLICATE_OBSERVATION" in duplicate.quality.codes
+        assert DataQualityCode.OUT_OF_ORDER in duplicate.quality.codes
+        if rechecked_at == "10:01:00":
+            assert DataQualityCode.STALE_SOURCE in duplicate.quality.codes
+            assert DataQualityCode.STALE_RECEIPT in duplicate.quality.codes
+            assert duplicate.quality.details["source_age_seconds"] == "60"
+        repeated = asyncio.run(collector.collect_once("NIFTY"))
+        assert repeated.quality == duplicate.quality
+    with SnapshotRepository(
+        database_path=database_path, parquet_root=parquet_root
+    ) as repository:
+        assert repository.load_collector_baseline("NIFTY") == current
+        assert len(list(repository.iter_session("NIFTY", date(2026, 8, 28)))) == 2
+        assert list(repository.iter_tradable_session("NIFTY", date(2026, 8, 28))) == [
+            current
+        ]
+        assert repository.session_quality_summary("NIFTY", date(2026, 8, 28)) == {
+            "snapshot_count": 2,
+            "tradable_count": 1,
+            "codes": {"BASELINE_UNAVAILABLE": 1},
+        }
+        with sqlite3.connect(database_path) as connection:
+            assert (
+                connection.execute(
+                    "SELECT * FROM quality_decisions ORDER BY id LIMIT 2"
+                ).fetchall()
+                == original_audits
+            )
+            assert (
+                connection.execute("SELECT * FROM collector_state").fetchall()
+                == original_state
+            )
+            audits = connection.execute(
+                "SELECT tradable, codes, details, checked_at FROM quality_decisions WHERE id > 2"
+            ).fetchall()
+        assert len(audits) >= 1
+        for tradable, codes, details, checked_at in audits:
+            assert not tradable
+            assert json.loads(codes) == list(duplicate.quality.codes)
+            assert json.loads(details) == duplicate.quality.details
+            assert aware(checked_at) == now
+            assert json.loads(details)["historical_quality_decision_id"] == "2"
+        assert {
+            path: path.read_bytes() for path in parquet_root.rglob("*.parquet")
+        } == parquet_before
 
 
 class _Broker:
@@ -40,6 +156,76 @@ def _raw() -> RawSnapshot:
         captured_at=aware("2026-08-30T10:00:00+05:30"),
         expiry=date(2026, 9, 1),
     )
+
+
+def test_duplicate_cannot_rewind_in_memory_baseline_with_custom_assessor(
+    tmp_path: Path,
+) -> None:
+    """A permissive injected assessor cannot make duplicate publication rewind state."""
+    first = make_chain(timestamp="2026-08-28T10:00:00+05:30")
+    later = make_chain(timestamp="2026-08-28T10:01:00+05:30")
+    snapshots = iter((first, later, first, later))
+    prior_observations = []
+
+    def assessor(_current, previous, checked_at):
+        prior_observations.append(previous)
+        return DataQualityReport(tradable=True, codes=(), checked_at=checked_at)
+
+    with SnapshotRepository(
+        database_path=tmp_path / "market.sqlite3",
+        parquet_root=tmp_path / "parquet",
+    ) as repository:
+        collector = Collector(
+            broker=_Broker(_raw()),
+            repository=repository,
+            normalizer=lambda *_args: next(snapshots),
+            quality_assessor=assessor,
+            clock=lambda: aware("2026-08-28T10:01:01+05:30"),
+        )
+        results = [asyncio.run(collector.collect_once("NIFTY")) for _ in range(4)]
+        assert results[2].quality is not None and results[2].quality.tradable is False
+        assert prior_observations == [None, first, later, later]
+        assert repository.load_collector_baseline("NIFTY") == later
+
+
+def test_duplicate_assessment_exception_retains_current_failure_audit(
+    tmp_path: Path,
+) -> None:
+    """A historical positive audit must not replace an assessor exception on reobservation."""
+    now = aware("2026-08-30T10:00:01+05:30")
+    should_raise = False
+
+    def assessor(_current, _previous, checked_at):
+        if should_raise:
+            raise ValueError("assessment failed")
+        return DataQualityReport(tradable=True, codes=(), checked_at=checked_at)
+
+    with SnapshotRepository(
+        database_path=tmp_path / "market.sqlite3",
+        parquet_root=tmp_path / "parquet",
+    ) as repository:
+        collector = Collector(
+            broker=_Broker(_raw()),
+            repository=repository,
+            quality_assessor=assessor,
+            clock=lambda: now,
+        )
+        first = asyncio.run(collector.collect_once("NIFTY"))
+        assert first.quality is not None and first.quality.tradable is True
+        should_raise = True
+        now = aware("2026-08-30T10:01:00+05:30")
+        duplicate = asyncio.run(collector.collect_once("NIFTY"))
+        assert duplicate.status is CollectionStatus.QUALITY_ASSESSMENT_FAILED
+        assert duplicate.quality is not None and duplicate.quality.tradable is False
+        assert duplicate.quality.checked_at == now
+        assert DataQualityCode.QUALITY_ASSESSMENT_FAILED in duplicate.quality.codes
+        assert DataQualityCode.DUPLICATE_OBSERVATION in duplicate.quality.codes
+        with sqlite3.connect(repository.database_path) as connection:
+            stored = connection.execute(
+                "SELECT codes, checked_at FROM quality_decisions ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        assert json.loads(stored[0]) == list(duplicate.quality.codes)
+        assert aware(stored[1]) == now
 
 
 def test_collector_saves_immutable_raw_before_normalization_and_persists_research_snapshot(
@@ -79,7 +265,9 @@ def test_collector_saves_immutable_raw_before_normalization_and_persists_researc
     repository.close()
 
 
-def test_collector_uses_raw_capture_as_the_normalized_receipt_time(tmp_path: Path) -> None:
+def test_collector_uses_raw_capture_as_the_normalized_receipt_time(
+    tmp_path: Path,
+) -> None:
     """Sampling a second clock after persistence would mislabel HTTP receipt time."""
     repository = SnapshotRepository(
         database_path=tmp_path / "market.sqlite3", parquet_root=tmp_path / "parquet"
