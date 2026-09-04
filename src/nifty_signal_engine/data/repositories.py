@@ -578,6 +578,17 @@ class SnapshotRepository:
         self, instrument: str, session_date: date
     ) -> Iterator[OptionChainSnapshot]:
         """Yield full snapshots in deterministic chronological order for one instrument session."""
+        for snapshot, _ in self.iter_audited_session(instrument, session_date):
+            yield snapshot
+
+    def iter_audited_session(
+        self, instrument: str, session_date: date
+    ) -> Iterator[tuple[OptionChainSnapshot, DataQualityReport]]:
+        """Replay integrity-checked snapshots with original first-publication audits.
+
+        Includes negative decisions so replay cannot silently bridge invalid bars.
+        Duplicate observation audits never replace or multiply historical inputs.
+        """
         if instrument not in {"NIFTY", "BANKNIFTY"}:
             raise ValueError(f"unsupported instrument: {instrument}")
         with self._engine.connect() as connection:
@@ -613,7 +624,10 @@ class SnapshotRepository:
                     snapshot,
                     serialization_version=self._serialization_version(typed_row),
                 )
-                yield snapshot
+                _, report = self._stored_quality_decision(
+                    connection, cast(int, typed_row["id"])
+                )
+                yield snapshot, report
 
     def iter_tradable_session(
         self, instrument: str, session_date: date
