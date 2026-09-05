@@ -127,3 +127,22 @@ def test_rejects_naive_price_timestamps() -> None:
             0.01,
             -0.01,
         )
+
+
+def test_aware_utc_path_is_normalized_to_asia_kolkata_outcome_timestamps() -> None:
+    index = pd.to_datetime(
+        ["2026-08-26T04:30:00Z", "2026-08-26T04:31:00Z", "2026-08-26T04:32:00Z"]
+    )
+    prices = pd.Series([100.0, 101.1, 100.0], index=index)
+
+    result = label_triple_barrier(
+        prices,
+        pd.Timestamp("2026-08-26T10:00:00+05:30"),
+        120,
+        0.01,
+        -0.01,
+    )
+
+    assert result.label is DirectionLabel.UP
+    assert result.barrier_time == pd.Timestamp("2026-08-26T10:01:00+05:30")
+    assert str(result.barrier_time.tz) == "Asia/Kolkata"

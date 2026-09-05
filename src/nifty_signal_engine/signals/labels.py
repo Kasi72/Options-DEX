@@ -11,6 +11,8 @@ from enum import StrEnum
 
 import pandas as pd  # type: ignore[import-untyped]
 
+from nifty_signal_engine.config.market_hours import IST
+
 
 class DirectionLabel(StrEnum):
     """Directional research targets, including outcomes excluded from fitting."""
@@ -115,6 +117,9 @@ def _validated_prices(prices: pd.Series | pd.DataFrame) -> tuple[pd.DataFrame, b
         raise TypeError("prices must be a pandas Series or OHLC DataFrame")
     if not isinstance(frame.index, pd.DatetimeIndex) or frame.index.tz is None:
         raise ValueError("prices must have timezone-aware timestamps")
+    # Canonicalize once so origins, calculations, and returned timestamps all
+    # share the engine-wide Asia/Kolkata contract while retaining each instant.
+    frame.index = frame.index.tz_convert(IST)
     if frame.empty:
         raise ValueError("prices must not be empty")
     if not frame.index.is_monotonic_increasing or frame.index.has_duplicates:
