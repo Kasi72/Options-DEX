@@ -31,3 +31,10 @@
 ## Concerns
 
 None. Generated `src/nifty_signal_engine.egg-info/` metadata from the dry-run is untracked and intentionally excluded from commits.
+
+## Review correction — canonical IST timestamps
+
+- Fix commit: `b6b089792d7edc8df4f4e0c124f6532c41a5e53f` (`fix: canonicalize triple-barrier timestamps to IST`).
+- RED: a UTC-indexed path with an equivalent Asia/Kolkata origin returned a UTC `barrier_time`; the new regression failed its canonical-timezone assertion.
+- GREEN: inputs are normalized once to `Asia/Kolkata` after aware-index validation and before origin lookup, slicing, or calculation. Returned barrier timestamps therefore use the global timezone while retaining the original instants.
+- Verification: `py -m pytest tests/unit/test_labels.py -v` — 12 passed; `py -m pytest -q` — 215 passed; `py -m ruff check src tests` and `py -m mypy src` — passed.
