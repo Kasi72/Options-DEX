@@ -7,6 +7,7 @@ import pytest
 
 from nifty_signal_engine.config.instruments import InstrumentConfig
 from nifty_signal_engine.features.pipeline import FeaturePipeline, FeatureRow
+from nifty_signal_engine.features.price import time_values
 from nifty_signal_engine.monitoring.data_quality import (
     DataQualityCode,
     DataQualityReport,
@@ -240,7 +241,8 @@ def test_features_have_explicit_units_real_values_and_honest_missing_status():
     pipeline = FeaturePipeline()
     feed(pipeline, 0)
     row = feed(pipeline, 15, volume=125, spot=24310)
-    assert 30 <= len(row.values) <= 60
+    # Binding 5m/acceleration correction expands the original approximate range.
+    assert 60 < len(row.values) <= 80
     assert row.values["observed_session_return"] == pytest.approx(24310 / 24300 - 1)
     assert row.values["call_oi"] == 100 and row.values["put_oi"] == 100
     assert row.values["oi_concentration"] == 1
@@ -413,3 +415,194 @@ def test_entirely_unseen_minutes_reset_all_completed_history():
     assert rows[1].values["spot_return_1m"] is None
     assert rows[1].values["atm_straddle_change"] is None
     assert rows[2].values["realized_volatility"] is None
+
+
+def variable_flow_rows() -> tuple[list, list]:
+    """Produce completed bars with call flow 3, 6, ..., 21 contracts."""
+    volumes = {
+        0: 100,
+        15: 101,
+        30: 102,
+        45: 103,
+        60: 104,
+        75: 106,
+        90: 108,
+        105: 110,
+        120: 112,
+        135: 115,
+        150: 118,
+        165: 121,
+        180: 124,
+        195: 128,
+        210: 132,
+        225: 136,
+        240: 140,
+        255: 145,
+        270: 150,
+        285: 155,
+        300: 160,
+        315: 166,
+        330: 172,
+        345: 178,
+        360: 184,
+        375: 191,
+        390: 198,
+        405: 205,
+        420: 212,
+    }
+    pipeline = FeaturePipeline()
+    flow = [
+        feed(pipeline, second, volume=volume, spot=24300)
+        for second, volume in volumes.items()
+    ]
+    return flow, list(pipeline.drain_completed())
+
+
+def test_five_minute_flow_windows_use_exactly_five_completed_bars():
+    _, rows = variable_flow_rows()
+    assert len(rows) == 7
+    for row in rows[:4]:
+        assert row.values["flow_5m_status"] == "WARMUP"
+        assert row.values["call_volume_increment_5m"] is None
+        assert row.values["flow_gex_rupees_5m"] is None
+    fifth, sixth = rows[4:6]
+    assert fifth.values["flow_5m_status"] == "VALID"
+    assert fifth.values["call_volume_increment_5m"] == 45
+    assert fifth.values["put_volume_increment_5m"] == 90
+    assert fifth.values["flow_gex_rupees_5m"] == pytest.approx(-16657085.717024812)
+    assert fifth.values["flow_gex_crore_5m"] == pytest.approx(-1.6657085717024812)
+    assert fifth.values["flow_dex_rupees_5m"] == pytest.approx(-40042322.10141834)
+    assert fifth.values["flow_dex_crore_5m"] == pytest.approx(-4.004232210141834)
+    assert sixth.values["call_volume_increment_5m"] == 60
+    assert sixth.values["put_volume_increment_5m"] == 120
+
+
+def test_acceleration_compares_only_prior_completed_windows():
+    flow, rows = variable_flow_rows()
+    assert all(
+        row is None or row.values["flow_5m_status"] == "COMPLETED_BARS_ONLY"
+        for row in flow
+    )
+    first, second, fifth, sixth = rows[0], rows[1], rows[4], rows[5]
+    assert first.values["flow_acceleration_1m_status"] == "WARMUP"
+    assert first.values["call_volume_acceleration_1m"] is None
+    assert second.values["flow_acceleration_1m_status"] == "VALID"
+    assert second.values["call_volume_acceleration_1m"] == 3
+    assert second.values["put_volume_acceleration_1m"] == 6
+    assert second.values["flow_gex_acceleration_1m_rupees"] == pytest.approx(
+        -1110431.2866242242
+    )
+    assert second.values["flow_dex_acceleration_1m_rupees"] == pytest.approx(
+        -2669485.76291964
+    )
+    assert fifth.values["flow_acceleration_5m_status"] == "WARMUP"
+    assert sixth.values["flow_acceleration_5m_status"] == "VALID"
+    assert sixth.values["call_volume_acceleration_5m"] == 15
+    assert sixth.values["put_volume_acceleration_5m"] == 30
+    assert sixth.values["flow_gex_acceleration_5m_rupees"] == pytest.approx(
+        -5553388.9609455895
+    )
+    assert sixth.values["flow_dex_acceleration_5m_rupees"] == pytest.approx(
+        -13347500.123912761
+    )
+
+
+def test_rejected_data_resets_five_minute_windows_without_mutating_counter_baseline():
+    pipeline = FeaturePipeline()
+    for second in range(0, 301, 15):
+        feed(pipeline, second, volume=100 + second, spot=24300)
+    before = pipeline.drain_completed()
+    assert before[-1].values["flow_5m_status"] == "VALID"
+    bad = sample(315, volume=999, spot=24300)
+    assert pipeline.on_snapshot(bad, quality(bad, tradable=False)) is None
+    # Increment still uses the last valid source counter, while rolling state is reset.
+    row = feed(pipeline, 330, volume=445, spot=24300)
+    assert row.values["call_volume_increment"] == 45
+    assert row.values["call_volume_increment_5m"] is None
+    for second in [345, 360, 375, 390, 405, 420]:
+        feed(pipeline, second, volume=100 + second, spot=24300)
+    after = pipeline.drain_completed()
+    assert after[-1].values["flow_5m_status"] == "WARMUP"
+
+
+def test_minutes_to_close_uses_available_time_and_fixed_ist_session_contract():
+    pipeline = FeaturePipeline()
+    first = sample(0)
+    pipeline.on_snapshot(first, quality(first))
+    current = sample(15, volume=125)
+    row = pipeline.on_snapshot(
+        current,
+        quality(current, checked_at=current.received_at + timedelta(seconds=15)),
+    )
+    assert row.values["minutes_to_close"] == pytest.approx(374.5)
+    assert (
+        time_values(
+            aware("2026-08-26T09:00:00+05:30"), aware("2026-08-26T09:00:00+05:30")
+        )["session_time_status"]
+        == "PREOPEN"
+    )
+    assert (
+        time_values(
+            aware("2026-08-26T15:30:00+05:30"), aware("2026-08-26T15:30:00+05:30")
+        )["session_time_status"]
+        == "POST_CLOSE"
+    )
+    # Current market-hours contract has no early-close override; 14:00 is regular.
+    early = time_values(
+        aware("2026-08-26T14:00:00+05:30"), aware("2026-08-26T14:00:00+05:30")
+    )
+    assert early == {
+        "minutes_since_open": 285.0,
+        "minutes_to_close": 90.0,
+        "session_time_status": "REGULAR",
+    }
+
+
+def test_pipeline_rejects_preopen_and_postclose_before_time_features():
+    pipeline = FeaturePipeline()
+    for second in [-900, 22500]:
+        chain = sample(second)
+        assert pipeline.on_snapshot(chain, quality(chain)) is None
+        assert pipeline.last_rejection_codes == ("OUTSIDE_SESSION",)
+
+
+def test_time_features_reject_naive_source_or_availability():
+    aware_time = aware("2026-08-26T10:00:00+05:30")
+    with pytest.raises(ValueError, match="timezone-aware"):
+        time_values(aware_time.replace(tzinfo=None), aware_time)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        time_values(aware_time, aware_time.replace(tzinfo=None))
+
+
+def test_observed_return_discloses_whether_true_session_open_was_seen():
+    exact = FeaturePipeline()
+    feed(exact, 0, spot=24300)
+    assert (
+        feed(exact, 15, volume=125, spot=24310).values["observed_session_return_status"]
+        == "SESSION_OPEN_OBSERVED"
+    )
+    late = FeaturePipeline()
+    feed(late, 15, spot=24310)
+    row = feed(late, 30, volume=125, spot=24320)
+    assert row.values["observed_session_return"] == pytest.approx(24320 / 24310 - 1)
+    assert row.values["observed_session_return_status"] == "OBSERVED_WINDOW"
+
+
+@pytest.mark.parametrize(("instrument", "day"), [("BANKNIFTY", 26), ("NIFTY", 27)])
+def test_five_minute_state_is_isolated_by_instrument_and_session(instrument, day):
+    pipeline = FeaturePipeline()
+    for second in range(0, 301, 15):
+        feed(pipeline, second, volume=100 + second, spot=24300)
+    assert pipeline.drain_completed()[-1].values["flow_5m_status"] == "VALID"
+    for second in range(0, 61, 15):
+        feed(
+            pipeline,
+            second,
+            volume=500 + second,
+            spot=49000 if instrument == "BANKNIFTY" else 24300,
+            instrument=instrument,
+            day=day,
+        )
+    (isolated,) = pipeline.drain_completed()
+    assert isolated.values["flow_5m_status"] == "WARMUP"
+    assert isolated.values["flow_acceleration_1m_status"] == "WARMUP"

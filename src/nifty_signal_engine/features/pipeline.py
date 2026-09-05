@@ -24,9 +24,14 @@ from nifty_signal_engine.config.market_hours import (
 )
 from nifty_signal_engine.domain.market import OptionChainSnapshot
 from nifty_signal_engine.features.bars import MinuteCoverage
-from nifty_signal_engine.features.flow import flow_values, incremental_weights
+from nifty_signal_engine.features.flow import (
+    FLOW_FIELDS,
+    completed_flow_values,
+    flow_values,
+    incremental_weights,
+)
 from nifty_signal_engine.features.option_structure import FeatureValue, structure_values
-from nifty_signal_engine.features.price import price_values
+from nifty_signal_engine.features.price import price_values, time_values
 from nifty_signal_engine.monitoring.data_quality import (
     MAX_SOURCE_AGE,
     DataQualityReport,
@@ -122,6 +127,7 @@ class _State:
     previous: OptionChainSnapshot
     checked_at: datetime
     session_open: float
+    session_open_observed: bool
     bar: MinuteCoverage
     spots: list[float] = field(default_factory=list)
     rows: list[FeatureRow] = field(default_factory=list)
@@ -130,6 +136,7 @@ class _State:
     ranges: list[tuple[float, float]] = field(default_factory=list)
     previous_structure: dict[str, FeatureValue] | None = None
     completed_structure: dict[str, FeatureValue] | None = None
+    completed_flows: list[dict[str, float]] = field(default_factory=list)
 
 
 class FeaturePipeline:
@@ -191,12 +198,20 @@ class FeaturePipeline:
             self.last_rejection_codes = (str(exc),)
             if state is not None:
                 state.bar.valid = False
+                self._reset_completed_history(state)
             return None
 
         self.last_rejection_codes = ()
         minute = timestamp.replace(second=0, microsecond=0)
         if state is None:
-            state = _State(snapshot, checked, snapshot.spot, MinuteCoverage(minute))
+            open_at = datetime.combine(timestamp.date(), REGULAR_OPEN, IST)
+            state = _State(
+                snapshot,
+                checked,
+                snapshot.spot,
+                timestamp == open_at,
+                MinuteCoverage(minute),
+            )
             state.bar.add(timestamp)
             state.spots.append(snapshot.spot)
             state.previous_structure = values
@@ -211,11 +226,17 @@ class FeaturePipeline:
             state.rows = []
         values.update(flow_values(snapshot, weights))
         values.update(
-            price_values([snapshot.spot], (), (), timestamp, state.session_open, ())
+            price_values(
+                [snapshot.spot],
+                (),
+                (),
+                timestamp,
+                state.session_open,
+                state.session_open_observed,
+                (),
+            )
         )
-        values["minutes_since_open"] = (
-            timestamp - datetime.combine(timestamp.date(), REGULAR_OPEN, IST)
-        ).total_seconds() / 60
+        values.update(time_values(timestamp, checked))
         prior = state.previous_structure or {}
         for name in ("atm_iv", "atm_skew", "atm_straddle"):
             before, current = prior.get(name), values[name]
@@ -239,7 +260,7 @@ class FeaturePipeline:
             available_at=checked,
             instrument=snapshot.instrument,
             session_date=timestamp.date(),
-            schema_version="1",
+            schema_version="2",
             values=values,
             quality_codes=(),
             source_timestamps=sources,
@@ -255,15 +276,9 @@ class FeaturePipeline:
 
     def _finish(self, state: _State, checked: datetime) -> None:
         if state.ends and state.ends[-1] != state.bar.start:
-            state.ends.clear()
-            state.closes.clear()
-            state.ranges.clear()
-            state.completed_structure = None
+            self._reset_completed_history(state)
         if not state.bar.complete(checked) or not state.rows:
-            state.ends.clear()
-            state.closes.clear()
-            state.ranges.clear()
-            state.completed_structure = None
+            self._reset_completed_history(state)
             return
         last = state.rows[-1]
         values = dict(last.values)
@@ -274,9 +289,11 @@ class FeaturePipeline:
                 state.closes,
                 state.bar.end,
                 state.session_open,
+                state.session_open_observed,
                 state.ranges,
             )
         )
+        values.update(time_values(state.bar.end, checked))
         for name in ("atm_iv", "atm_skew", "atm_straddle"):
             before = (state.completed_structure or {}).get(name)
             current = values[name]
@@ -306,6 +323,12 @@ class FeaturePipeline:
                 assert isinstance(value, (int, float))
                 total += value
             values[name] = total
+        current_flow: dict[str, float] = {}
+        for name in FLOW_FIELDS:
+            value = values[name]
+            assert isinstance(value, (int, float))
+            current_flow[name] = float(value)
+        values.update(completed_flow_values(current_flow, state.completed_flows))
         sources = tuple(t for row in state.rows for t in row.source_timestamps)
         self._completed.append(
             FeatureRow(
@@ -326,6 +349,16 @@ class FeaturePipeline:
         state.closes.append(state.spots[-1])
         state.ranges.append((max(state.spots), min(state.spots)))
         state.completed_structure = values
+        state.completed_flows.append(current_flow)
+        del state.completed_flows[:-5]
+
+    @staticmethod
+    def _reset_completed_history(state: _State) -> None:
+        state.ends.clear()
+        state.closes.clear()
+        state.ranges.clear()
+        state.completed_structure = None
+        state.completed_flows.clear()
 
     def _validate(
         self, snapshot: OptionChainSnapshot, quality: DataQualityReport | None

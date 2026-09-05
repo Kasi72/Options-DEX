@@ -5,7 +5,12 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta
 from itertools import pairwise
 
-from nifty_signal_engine.config.market_hours import IST, REGULAR_OPEN
+from nifty_signal_engine.config.market_hours import (
+    IST,
+    REGULAR_CLOSE,
+    REGULAR_OPEN,
+    market_phase,
+)
 from nifty_signal_engine.features.option_structure import FeatureValue
 
 
@@ -15,6 +20,7 @@ def price_values(
     closes: Sequence[float],
     current_end: datetime,
     session_open: float,
+    session_open_observed: bool,
     ranges: Sequence[tuple[float, float]],
 ) -> dict[str, FeatureValue]:
     contiguous = bool(ends and ends[-1] == current_end - timedelta(minutes=1))
@@ -44,6 +50,9 @@ def price_values(
         "spot_low": min(spots),
         "spot_close": spots[-1],
         "observed_session_return": spots[-1] / session_open - 1,
+        "observed_session_return_status": (
+            "SESSION_OPEN_OBSERVED" if session_open_observed else "OBSERVED_WINDOW"
+        ),
         "spot_return_1m": spots[-1] / closes[-1] - 1 if contiguous else None,
         "realized_volatility": volatility,
         "opening_range_high": high,
@@ -68,3 +77,22 @@ def price_values(
         "cross_index_return": None,
         "cross_index_status": "MISSING_INPUT",
     }
+
+
+def time_values(source_at: datetime, available_at: datetime) -> dict[str, FeatureValue]:
+    """Return fixed-session IST times; the current contract has no early closes."""
+    source = _as_ist(source_at)
+    available = _as_ist(available_at)
+    open_at = datetime.combine(source.date(), REGULAR_OPEN, IST)
+    close_at = datetime.combine(source.date(), REGULAR_CLOSE, IST)
+    return {
+        "minutes_since_open": (source - open_at).total_seconds() / 60,
+        "minutes_to_close": (close_at - available).total_seconds() / 60,
+        "session_time_status": market_phase(source).value,
+    }
+
+
+def _as_ist(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("timestamp must be timezone-aware")
+    return value.astimezone(IST)
