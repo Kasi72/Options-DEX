@@ -72,3 +72,34 @@
 
 - Calibration and validation identities are auditable scaffolding, not proof from a signed/registered artifact store. Task 13 must populate them from chronological calibration and walk-forward validation outputs; until then normal baseline predictions remain `RESEARCH/NO_TRADE`.
 - `DataQualityReport` has no typed instrument field, so the selective gate consumes an explicit `details["instrument"]` provenance value and abstains when it is absent. A future additive quality-contract migration should make this field first-class while preserving stored-audit compatibility.
+
+## Correction round 2
+
+### Commit
+
+- Correction commit: `ac59409380a1770bae855a2ef178684cc7c09b70` (`fix: keep baseline promotion fail closed`).
+
+### Changes
+
+- Matching non-empty calibration and validation identifiers no longer promote a scaffold-only result. Without separate artifact evidence, evaluation remains `RESEARCH/NO_TRADE` and reports `MODEL_NOT_PROMOTED`, `CALIBRATION_NOT_VALIDATED`, and `VALIDATION_NOT_PROMOTED`.
+- Added explicit calibration-artifact validation and validation-artifact promotion flags to the selective input and research-signal audit output. These are independent of identifier strings; both flags plus the existing `validated` state and all other gates are required by the future action seam.
+- Logistic fitting now requires an `instrument` column on every training frame. The column must be non-null, contain exactly one supported instrument, and match the model's configured NIFTY or BANKNIFTY identity. Untagged, mixed, unknown, and mismatched frames are rejected before fitting.
+- Prediction remains convenient but safe: a feature-only row can be scored only after the model was fitted from explicitly tagged single-instrument training data, and an explicitly conflicting prediction instrument is still rejected.
+
+### TDD evidence
+
+- RED/GREEN: the complete matching-string scaffold previously emitted `BUY_CALL`; it now abstains with the three explicit promotion/calibration reasons.
+- RED/GREEN: the future artifact-flag seam initially failed construction because the flags did not exist; a complete evidenced fixture now reaches the prior research-action branch without weakening the default.
+- RED/GREEN: an untagged frame previously fitted silently as NIFTY while mixed/null/unknown cases already rejected; all four cases now reject through one explicit instrument-identity contract.
+
+### Verification
+
+- `py -m pytest tests/unit/test_baselines.py tests/unit/test_selective_signals.py tests/integration/test_baseline_pipeline.py -v` — 44 passed.
+- `py -m pytest -q` — 259 passed.
+- `py -m ruff check src tests` — passed.
+- `py -m mypy src` — passed for 34 source files.
+- Signal-package scan found no credential or order-submission path.
+
+### Remaining concern
+
+- The artifact flags are deliberately inert defaults in Phases 0–4. Task 13 must source them from verified calibration and validation artifacts rather than application configuration or user-provided identifiers.
