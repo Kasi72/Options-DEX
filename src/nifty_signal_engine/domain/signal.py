@@ -1,6 +1,7 @@
 """Immutable research-signal contracts."""
 
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -16,5 +17,16 @@ class SignalAction(StrEnum):
 class ResearchSignal(BaseModel, frozen=True):
     """A provisional research decision and its explicit rationale."""
 
+    mode: Literal["RESEARCH"] = "RESEARCH"
     action: SignalAction = SignalAction.NO_TRADE
+    instrument: Literal["NIFTY", "BANKNIFTY"] | None = None
+    direction: Literal["BUY", "SELL"] | None = None
     reasons: tuple[str, ...] = ()
+    buy_threshold: float | None = None
+    sell_threshold: float | None = None
+    model_disagreement: float | None = None
+    meta_label_probability: float | None = None
+    conformal_accepted: bool | None = None
+    sequential_evidence_accepted: bool | None = None
+    economics_accepted: bool | None = None
+    expected_value_after_costs: float | None = None
