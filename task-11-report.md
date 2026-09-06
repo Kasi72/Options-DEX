@@ -103,3 +103,36 @@
 ### Remaining concern
 
 - The artifact flags are deliberately inert defaults in Phases 0–4. Task 13 must source them from verified calibration and validation artifacts rather than application configuration or user-provided identifiers.
+
+## Correction round 3
+
+### Commit
+
+- Correction commit: `715e9619d859f9d68ae46c6eb7e922862629f0da` (`fix: disable phase baseline promotion`).
+
+### Changes
+
+- `SelectiveDecision.evaluate()` is now unconditionally fail-closed for Phases 0–4: every evaluation returns `mode=RESEARCH` and `action=NO_TRADE`, including callers that provide matching provenance identifiers, permissive thresholds, or otherwise passing gate values.
+- Every result records `MODEL_PROMOTION_UNAVAILABLE` and `PHASE_PROMOTION_DISABLED`, while preserving applicable provenance, calibration, validation, quality, and economics abstention reasons.
+- Removed the public calibration-validation and model-promotion booleans from both the decision input and serialized research output. Former boolean arguments and arbitrary promotion-token arguments are rejected rather than serving as caller-controlled authorization.
+- The only future seam is a private, unconditional phase-reason tuple with a Task 13 note: Task 13 must replace it with evidence resolved by a verified promotion-artifact registry. No current public field can bypass the phase policy.
+- Direction-to-option action mappings remain independently testable and unchanged: bullish BUY permits only a long call or call debit spread, and bearish SELL permits only a long put or put debit spread.
+
+### TDD evidence
+
+- RED/GREEN: matching provenance, arbitrary identifiers, permissive gates, and both formerly public booleans previously reached or could reach `BUY_CALL`; the regression now proves the result remains `RESEARCH/NO_TRADE` with explicit phase-promotion reasons.
+- RED/GREEN: the old public booleans were initially accepted by the constructor; parameterized adversarial tests now prove both booleans and an arbitrary promotion token raise `TypeError`.
+- Existing regressions continue to cover strict fit-time instrument validation, train-fitted scaling, tie abstention, real `FeaturePipeline` interoperability, missing-input failure, provenance mismatches, and safe action mappings.
+
+### Verification
+
+- Focused Task 11 suite — 46 passed.
+- Full suite (`py -m pytest -q`) — 261 passed in an isolated run.
+- `py -m ruff check src tests` — passed.
+- `py -m mypy src` — passed for 34 source files.
+- `git diff --check` — passed (Git emitted only existing CRLF conversion warnings).
+- An initial concurrent full/focused run exhausted host memory while importing sklearn; rerunning the full suite alone passed cleanly.
+
+### Remaining concern
+
+- There is intentionally no promotion mechanism in Phases 0–4. Task 13 must introduce a registry-backed, verified promotion artifact before any action-producing branch is added; caller-populated IDs, flags, or tokens must never be accepted as evidence.
