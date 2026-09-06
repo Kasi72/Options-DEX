@@ -36,3 +36,39 @@
 
 - The current feature pipeline deliberately reports VWAP as unavailable and does not yet produce a validated regime field. Consequently, the rule baseline rejects current pipeline rows rather than inventing confluence; later feature work must supply both inputs before it can emit a directional research probability.
 - Host-wide `py -m pip check` reports pre-existing missing extras for unrelated `pkdevtools`, `pknsetools`, and `pandas-ta` packages. Task 11 imports and tests scikit-learn 1.7.2 successfully; no project test or static check is affected.
+
+## Correction round 1
+
+### Commit
+
+- Correction commit: `782be16a4a94e77ee733663823d80a37b574913e` (`fix: harden research baseline provenance`).
+
+### Changes
+
+- Equal BUY/SELL probabilities now explicitly produce `NO_DIRECTIONAL_EDGE`, with `direction=None` and `NO_TRADE` even when every threshold and downstream gate is permissive.
+- Replaced the rule baseline's impossible VWAP/regime prerequisites with supported completed-row inputs: price movement, flow DEX, OI DEX, regular-session status, and completed-flow status. A real `FeaturePipeline` integration test proves deterministic interoperability; missing, invalid, incomplete, or disagreeing inputs still fail closed or favor `NO_MOVE`.
+- Inserted `StandardScaler` after train-fitted median imputation and before logistic regression in the same sklearn `Pipeline`. Unit-rescaled features produce stable probabilities, and exposed scale parameters remain fixed after the caller mutates the original training frame.
+- Added canonical IST provenance to directional predictions and research signals: feature availability, model and feature-schema versions, horizon, training-window bounds and identity, calibration identity/time, and validation-report identity/time.
+- A promoted selective decision pins the expected model, schema, horizon, training, calibration, and validation identities. Action remains impossible without a matching quality instrument, completed feature row, feature/schema time match, calibrated probabilities, a validation report completed before prediction, and all existing safety/economics gates.
+- Added serialization, instrument mismatch, identity mismatch, missing-provenance, validation chronology, and naïve-quality timestamp regressions. No order, network, credential, or source-data path changed.
+
+### TDD evidence
+
+- RED/GREEN: equal UP/DOWN probabilities previously selected `SELL`; the new tie regression observed `BUY_PUT` before the tie-abstention branch was added.
+- RED/GREEN: a real completed pipeline row previously raised `vwap features are not valid`; the rule now consumes only currently emitted fields.
+- RED/GREEN: multiplying one feature by one billion changed the unscaled logistic probability from approximately `0.8904` to `0.9753`; train-fitted scaling now makes unit-equivalent predictions agree to `1e-12`.
+- RED/GREEN: provenance tests initially failed on absent fields/signatures and allowed an unprovenanced action; matching provenance is now serialized while every missing/mismatched field abstains.
+- RED/GREEN: UTC training provenance remained UTC and a naïve quality time crashed aware comparison; training timestamps are canonicalized to IST and invalid quality chronology fails closed.
+
+### Verification
+
+- `py -m pytest tests/unit/test_baselines.py tests/unit/test_selective_signals.py tests/integration/test_baseline_pipeline.py -v` — 39 passed.
+- `py -m pytest -q` — 254 passed.
+- `py -m ruff check src tests` — passed.
+- `py -m mypy src` — passed for 34 source files.
+- `git diff --cached --check` — passed before the correction commit.
+
+### Remaining concerns
+
+- Calibration and validation identities are auditable scaffolding, not proof from a signed/registered artifact store. Task 13 must populate them from chronological calibration and walk-forward validation outputs; until then normal baseline predictions remain `RESEARCH/NO_TRADE`.
+- `DataQualityReport` has no typed instrument field, so the selective gate consumes an explicit `details["instrument"]` provenance value and abstains when it is absent. A future additive quality-contract migration should make this field first-class while preserving stored-audit compatibility.
