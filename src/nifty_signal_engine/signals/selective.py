@@ -18,6 +18,15 @@ from nifty_signal_engine.signals.service import allowed_actions
 
 Direction = Literal["BUY", "SELL"]
 _INSTRUMENTS = frozenset({"NIFTY", "BANKNIFTY"})
+# Task 13 must replace this unconditional internal phase gate with evidence
+# resolved by a verified promotion-artifact registry. No caller input controls it.
+_PHASE_PROMOTION_REASONS = (
+    "MODEL_PROMOTION_UNAVAILABLE",
+    "PHASE_PROMOTION_DISABLED",
+    "MODEL_NOT_PROMOTED",
+    "CALIBRATION_NOT_VALIDATED",
+    "VALIDATION_NOT_PROMOTED",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,10 +74,8 @@ class SelectiveDecision:
     horizon_minutes: int | None = None
     training_window_id: str | None = None
     calibration_id: str | None = None
-    calibration_artifact_validated: bool = False
     validation_report_id: str | None = None
     validation_completed_at: datetime | None = None
-    validation_artifact_promoted: bool = False
 
     def __post_init__(self) -> None:
         buy = _validated_thresholds(self.buy_thresholds, "BUY")
@@ -100,13 +107,8 @@ class SelectiveDecision:
             isinstance(self.horizon_minutes, bool) or self.horizon_minutes <= 0
         ):
             raise ValueError("horizon_minutes must be positive")
-        for name in (
-            "validated",
-            "calibration_artifact_validated",
-            "validation_artifact_promoted",
-        ):
-            if not isinstance(getattr(self, name), bool):
-                raise TypeError(f"{name} must be boolean")
+        if not isinstance(self.validated, bool):
+            raise TypeError("validated must be boolean")
         if self.validation_completed_at is not None and (
             self.validation_completed_at.tzinfo is None
             or self.validation_completed_at.utcoffset() is None
@@ -145,12 +147,7 @@ class SelectiveDecision:
 
         reasons.extend(self._provenance_reasons(prediction, quality, row))
 
-        if not self.validated or not self.validation_artifact_promoted:
-            reasons.append("MODEL_NOT_PROMOTED")
-        if not self.calibration_artifact_validated:
-            reasons.append("CALIBRATION_NOT_VALIDATED")
-        if not self.validation_artifact_promoted:
-            reasons.append("VALIDATION_NOT_PROMOTED")
+        reasons.extend(_PHASE_PROMOTION_REASONS)
 
         calibrated = (
             prediction.calibrated_up,
@@ -200,7 +197,6 @@ class SelectiveDecision:
         elif not self.sequential_evidence_accepted:
             reasons.append("SEQUENTIAL_EVIDENCE_REJECTED")
 
-        selected_action = SignalAction.NO_TRADE
         if economics is None:
             reasons.append("ECONOMICS_UNAVAILABLE")
         elif not isinstance(economics, EconomicsAssessment):
@@ -214,13 +210,8 @@ class SelectiveDecision:
                 economics.for_direction(direction)
             except ValueError:
                 reasons.append("ECONOMICS_ACTION_UNSAFE")
-            else:
-                selected_action = economics.action
-
-        if reasons:
-            selected_action = SignalAction.NO_TRADE
         return ResearchSignal(
-            action=selected_action,
+            action=SignalAction.NO_TRADE,
             instrument=instrument,
             direction=direction,
             reasons=tuple(dict.fromkeys(reasons)),
@@ -243,10 +234,8 @@ class SelectiveDecision:
             training_window_id=prediction.training_window_id,
             calibration_id=prediction.calibration_id,
             calibration_completed_at=prediction.calibration_completed_at,
-            calibration_artifact_validated=self.calibration_artifact_validated,
             validation_report_id=prediction.validation_report_id,
             validation_completed_at=self.validation_completed_at,
-            validation_artifact_promoted=self.validation_artifact_promoted,
         )
 
     def _provenance_reasons(

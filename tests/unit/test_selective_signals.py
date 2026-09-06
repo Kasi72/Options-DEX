@@ -293,9 +293,9 @@ def test_matching_string_provenance_cannot_promote_scaffold_only_signal() -> Non
         "MODEL_NOT_PROMOTED",
         "CALIBRATION_NOT_VALIDATED",
         "VALIDATION_NOT_PROMOTED",
+        "MODEL_PROMOTION_UNAVAILABLE",
+        "PHASE_PROMOTION_DISABLED",
     }
-    assert signal.calibration_artifact_validated is False
-    assert signal.validation_artifact_promoted is False
     assert signal.validation_report_id == "walk-forward-2026-08"
     assert signal.training_window_id == "train-2026-q2"
     assert signal.feature_available_at == stamp
@@ -303,40 +303,19 @@ def test_matching_string_provenance_cannot_promote_scaffold_only_signal() -> Non
     assert signal.model_dump(mode="json")["feature_available_at"] == stamp.isoformat()
 
 
-def test_explicit_artifact_promotion_flags_preserve_future_action_path() -> None:
-    stamp = datetime.fromisoformat("2026-08-26T10:00:00+05:30")
-    signal = SelectiveDecision(
-        validated=True,
-        calibration_artifact_validated=True,
-        validation_artifact_promoted=True,
-        **decision_provenance(stamp),
-        buy_thresholds={"NIFTY": 0.8, "BANKNIFTY": 0.9},
-        sell_thresholds={"NIFTY": 0.85, "BANKNIFTY": 0.95},
-        maximum_model_disagreement=0.2,
-        model_disagreement=0.1,
-        meta_label_threshold=0.7,
-        meta_label_probability=0.9,
-        conformal_accepted=True,
-        sequential_evidence_accepted=True,
-    ).evaluate(
-        prediction(
-            calibrated_up=0.9,
-            calibrated_down=0.05,
-            calibrated_no_move=0.05,
-            **provenance(stamp),
-        ),
-        quality().model_copy(update={"details": {"instrument": "NIFTY"}}),
-        EconomicsAssessment(
-            accepted=True,
-            action=SignalAction.BUY_CALL,
-            expected_value_after_costs=25.0,
-        ),
-        row=feature_row(stamp=stamp),
-    )
-    assert signal.action is SignalAction.BUY_CALL
-    assert signal.reasons == ()
-    assert signal.calibration_artifact_validated is True
-    assert signal.validation_artifact_promoted is True
+@pytest.mark.parametrize(
+    "forged",
+    [
+        {"calibration_artifact_validated": True},
+        {"validation_artifact_promoted": True},
+        {"promotion_token": "caller-controlled-token"},
+    ],
+)
+def test_public_promotion_booleans_and_tokens_are_not_accepted(
+    forged: dict[str, object],
+) -> None:
+    with pytest.raises(TypeError):
+        SelectiveDecision(**forged)
 
 
 @pytest.mark.parametrize(
