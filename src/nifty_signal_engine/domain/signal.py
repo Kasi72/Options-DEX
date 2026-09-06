@@ -1,5 +1,6 @@
 """Immutable research-signal contracts."""
 
+from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
@@ -30,3 +31,14 @@ class ResearchSignal(BaseModel, frozen=True):
     sequential_evidence_accepted: bool | None = None
     economics_accepted: bool | None = None
     expected_value_after_costs: float | None = None
+    feature_available_at: datetime | None = None
+    model_version: str | None = None
+    feature_schema_version: str | None = None
+    horizon_minutes: int | None = None
+    training_window_start: datetime | None = None
+    training_window_end: datetime | None = None
+    training_window_id: str | None = None
+    calibration_id: str | None = None
+    calibration_completed_at: datetime | None = None
+    validation_report_id: str | None = None
+    validation_completed_at: datetime | None = None

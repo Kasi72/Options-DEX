@@ -1,8 +1,9 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
 from nifty_signal_engine.domain.signal import SignalAction
+from nifty_signal_engine.features.pipeline import FeatureRow
 from nifty_signal_engine.monitoring.data_quality import (
     DataQualityCode,
     DataQualityReport,
@@ -36,6 +37,51 @@ def prediction(**updates: object) -> DirectionProbabilities:
     }
     values.update(updates)
     return DirectionProbabilities(**values)
+
+
+def provenance(stamp: datetime) -> dict[str, object]:
+    return {
+        "feature_available_at": stamp,
+        "model_version": "logistic-v1",
+        "feature_schema_version": "2",
+        "horizon_minutes": 15,
+        "training_window_start": stamp - timedelta(days=60),
+        "training_window_end": stamp - timedelta(days=10),
+        "training_window_id": "train-2026-q2",
+        "calibration_id": "calibration-2026-08",
+        "calibration_completed_at": stamp - timedelta(days=5),
+        "validation_report_id": "walk-forward-2026-08",
+    }
+
+
+def decision_provenance(stamp: datetime) -> dict[str, object]:
+    return {
+        "model_version": "logistic-v1",
+        "feature_schema_version": "2",
+        "horizon_minutes": 15,
+        "training_window_id": "train-2026-q2",
+        "calibration_id": "calibration-2026-08",
+        "validation_report_id": "walk-forward-2026-08",
+        "validation_completed_at": stamp - timedelta(days=1),
+    }
+
+
+def feature_row(
+    *, instrument: str = "NIFTY", stamp: datetime | None = None
+) -> FeatureRow:
+    available = stamp or datetime.fromisoformat("2026-08-26T10:00:00+05:30")
+    return FeatureRow(
+        available_at=available,
+        instrument=instrument,
+        session_date=available.date(),
+        schema_version="2",
+        values={},
+        quality_codes=(),
+        row_kind="COMPLETED_MINUTE",
+        completed=True,
+        bar_start=available - timedelta(minutes=1),
+        bar_end=available,
+    )
 
 
 def test_bearish_direction_maps_to_buy_put_not_naked_sell() -> None:
@@ -141,7 +187,39 @@ def test_instrument_specific_threshold_is_used() -> None:
     assert "BUY_THRESHOLD_NOT_MET" in signal.reasons
 
 
-def test_all_available_gates_can_only_emit_safe_research_action() -> None:
+def test_equal_up_down_probabilities_have_no_directional_edge() -> None:
+    signal = SelectiveDecision(
+        validated=True,
+        buy_thresholds={"NIFTY": 0.4, "BANKNIFTY": 0.4},
+        sell_thresholds={"NIFTY": 0.4, "BANKNIFTY": 0.4},
+        maximum_model_disagreement=0.2,
+        model_disagreement=0.1,
+        meta_label_threshold=0.7,
+        meta_label_probability=0.9,
+        conformal_accepted=True,
+        sequential_evidence_accepted=True,
+    ).evaluate(
+        prediction(
+            up=0.45,
+            down=0.45,
+            no_move=0.1,
+            calibrated_up=0.45,
+            calibrated_down=0.45,
+            calibrated_no_move=0.1,
+        ),
+        quality(),
+        EconomicsAssessment(
+            accepted=True,
+            action=SignalAction.BUY_PUT,
+            expected_value_after_costs=25.0,
+        ),
+    )
+    assert signal.action is SignalAction.NO_TRADE
+    assert signal.direction is None
+    assert "NO_DIRECTIONAL_EDGE" in signal.reasons
+
+
+def test_all_available_gates_without_provenance_still_abstain() -> None:
     signal = SelectiveDecision(
         validated=True,
         buy_thresholds={"NIFTY": 0.8, "BANKNIFTY": 0.9},
@@ -166,9 +244,110 @@ def test_all_available_gates_can_only_emit_safe_research_action() -> None:
         ),
     )
     assert signal.mode == "RESEARCH"
+    assert signal.action is SignalAction.NO_TRADE
+    assert set(signal.reasons) >= {
+        "FEATURE_ROW_MISSING",
+        "FEATURE_TIME_MISSING",
+        "MODEL_VERSION_MISSING",
+        "FEATURE_SCHEMA_VERSION_MISSING",
+        "HORIZON_MISSING",
+        "TRAINING_WINDOW_MISSING",
+        "TRAINING_WINDOW_ID_MISSING",
+        "CALIBRATION_ID_MISSING",
+        "VALIDATION_REPORT_ID_MISSING",
+    }
+
+
+def test_matching_provenance_allows_only_a_research_action() -> None:
+    stamp = datetime.fromisoformat("2026-08-26T10:00:00+05:30")
+    signal = SelectiveDecision(
+        validated=True,
+        **decision_provenance(stamp),
+        buy_thresholds={"NIFTY": 0.8, "BANKNIFTY": 0.9},
+        sell_thresholds={"NIFTY": 0.85, "BANKNIFTY": 0.95},
+        maximum_model_disagreement=0.2,
+        model_disagreement=0.1,
+        meta_label_threshold=0.7,
+        meta_label_probability=0.9,
+        conformal_accepted=True,
+        sequential_evidence_accepted=True,
+    ).evaluate(
+        prediction(
+            calibrated_up=0.9,
+            calibrated_down=0.05,
+            calibrated_no_move=0.05,
+            **provenance(stamp),
+        ),
+        quality().model_copy(update={"details": {"instrument": "NIFTY"}}),
+        EconomicsAssessment(
+            accepted=True,
+            action=SignalAction.BUY_CALL,
+            expected_value_after_costs=25.0,
+        ),
+        row=feature_row(stamp=stamp),
+    )
+    assert signal.mode == "RESEARCH"
     assert signal.action is SignalAction.BUY_CALL
     assert signal.direction == "BUY"
     assert signal.reasons == ()
+    assert signal.validation_report_id == "walk-forward-2026-08"
+    assert signal.training_window_id == "train-2026-q2"
+    assert signal.feature_available_at == stamp
+    assert str(signal.validation_completed_at.tzinfo) == "Asia/Kolkata"
+    assert signal.model_dump(mode="json")["feature_available_at"] == stamp.isoformat()
+
+
+@pytest.mark.parametrize(
+    "mismatch", ["row_instrument", "quality_instrument", "time", "model_identity"]
+)
+def test_prediction_quality_and_row_provenance_must_match(mismatch: str) -> None:
+    stamp = datetime.fromisoformat("2026-08-26T10:00:00+05:30")
+    row = feature_row(stamp=stamp)
+    report = quality().model_copy(update={"details": {"instrument": "NIFTY"}})
+    if mismatch == "row_instrument":
+        row = feature_row(instrument="BANKNIFTY", stamp=stamp)
+    elif mismatch == "quality_instrument":
+        report = report.model_copy(update={"details": {"instrument": "BANKNIFTY"}})
+    elif mismatch == "time":
+        report = report.model_copy(update={"checked_at": stamp - timedelta(seconds=1)})
+    prediction_provenance = provenance(stamp)
+    if mismatch == "model_identity":
+        prediction_provenance["model_version"] = "different-model"
+    signal = SelectiveDecision(
+        validated=True,
+        **decision_provenance(stamp),
+    ).evaluate(
+        prediction(**prediction_provenance),
+        report,
+        row=row,
+    )
+    assert signal.action is SignalAction.NO_TRADE
+    expected = {
+        "time": "QUALITY_PREDATES_FEATURES",
+        "model_identity": "MODEL_VERSION_MISMATCH",
+    }.get(mismatch, "INSTRUMENT_MISMATCH")
+    assert expected in signal.reasons
+
+
+def test_validation_identity_and_chronology_are_required_for_promotion() -> None:
+    stamp = datetime.fromisoformat("2026-08-26T10:00:00+05:30")
+    signal = SelectiveDecision(
+        validated=True,
+        **(
+            decision_provenance(stamp)
+            | {
+                "validation_report_id": "different-report",
+                "validation_completed_at": stamp + timedelta(seconds=1),
+            }
+        ),
+    ).evaluate(
+        prediction(**provenance(stamp)),
+        quality().model_copy(update={"details": {"instrument": "NIFTY"}}),
+        row=feature_row(stamp=stamp),
+    )
+    assert signal.action is SignalAction.NO_TRADE
+    assert "VALIDATION_REPORT_MISMATCH" in signal.reasons
+    assert "VALIDATION_AFTER_PREDICTION" in signal.reasons
 
 
 def test_economics_cannot_select_wrong_side_action() -> None:
@@ -198,5 +377,25 @@ def test_naive_quality_timestamp_fails_closed() -> None:
         update={"checked_at": datetime.fromisoformat("2026-08-26T10:00:00")}
     )
     signal = SelectiveDecision().evaluate(prediction(), naive)
+    assert signal.action is SignalAction.NO_TRADE
+    assert "QUALITY_TIMESTAMP_INVALID" in signal.reasons
+
+
+def test_naive_quality_timestamp_with_provenance_does_not_break_chronology_gate() -> None:
+    stamp = datetime.fromisoformat("2026-08-26T10:00:00+05:30")
+    naive = quality().model_copy(
+        update={
+            "checked_at": datetime.fromisoformat("2026-08-26T10:00:00"),
+            "details": {"instrument": "NIFTY"},
+        }
+    )
+    signal = SelectiveDecision(
+        validated=True,
+        **decision_provenance(stamp),
+    ).evaluate(
+        prediction(**provenance(stamp)),
+        naive,
+        row=feature_row(stamp=stamp),
+    )
     assert signal.action is SignalAction.NO_TRADE
     assert "QUALITY_TIMESTAMP_INVALID" in signal.reasons

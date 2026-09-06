@@ -24,13 +24,12 @@ def completed_row(
         session_date=end.date(),
         schema_version="2",
         values={
-            "spot_return_1m": direction * 0.001,
-            "vwap_distance": direction * 5.0,
-            "vwap_slope": direction * 0.5,
-            "vwap_status": "VALID",
-            "regime_direction": direction,
-            "regime_status": "VALID",
+            "spot_open": 100.0,
+            "spot_close": 100.0 + direction,
             "flow_dex_rupees": direction * flow,
+            "oi_dex_rupees": direction * 1_000.0,
+            "session_time_status": "REGULAR",
+            "flow_5m_status": "WARMUP",
         },
         quality_codes=(),
         row_kind="COMPLETED_MINUTE",
@@ -79,17 +78,19 @@ def test_rule_baseline_abstains_on_disagreement() -> None:
     assert prediction.no_move > prediction.down
 
 
-@pytest.mark.parametrize("fault", ["flow", "regime", "vwap", "incomplete", "quality"])
+@pytest.mark.parametrize(
+    "fault", ["flow", "session", "exposure", "incomplete", "quality"]
+)
 def test_rule_baseline_rejects_unusable_feature_rows(fault: str) -> None:
     row = completed_row()
     values = dict(row.values)
     updates: dict[str, object] = {}
     if fault == "flow":
         values["flow_dex_rupees"] = None
-    elif fault == "regime":
-        values["regime_status"] = "WARMUP"
-    elif fault == "vwap":
-        values["vwap_status"] = "MISSING_INPUT"
+    elif fault == "session":
+        values["session_time_status"] = "POST_CLOSE"
+    elif fault == "exposure":
+        values["oi_dex_rupees"] = None
     elif fault == "incomplete":
         updates.update(completed=False, row_kind="FLOW", bar_start=None, bar_end=None)
     else:
@@ -130,6 +131,60 @@ def test_logistic_baseline_exposes_auditable_fitted_parameters() -> None:
     assert set(model.coefficients) == {"DOWN", "NO_MOVE", "UP"}
     assert all(len(weights) == 2 for weights in model.coefficients.values())
     assert set(model.intercepts) == {"DOWN", "NO_MOVE", "UP"}
+
+
+def test_logistic_scaler_is_train_fitted_and_stable_across_feature_units() -> None:
+    labels = ["DOWN"] * 3 + ["NO_MOVE"] * 3 + ["UP"] * 3
+    ordinary = training_frame()
+    heterogeneous = ordinary.assign(flow=ordinary["flow"] * 1_000_000_000)
+    ordinary_model = LogisticBaseline(instrument="NIFTY").fit(ordinary, labels)
+    heterogeneous_model = LogisticBaseline(instrument="NIFTY").fit(
+        heterogeneous, labels
+    )
+
+    ordinary_result = ordinary_model.predict_proba(
+        {"instrument": "NIFTY", "momentum": 2.5, "flow": 1.5}
+    )
+    heterogeneous_result = heterogeneous_model.predict_proba(
+        {"instrument": "NIFTY", "momentum": 2.5, "flow": 1_500_000_000}
+    )
+
+    assert heterogeneous_result.up == pytest.approx(ordinary_result.up, abs=1e-12)
+    assert ordinary_model.training_scales == pytest.approx(
+        {"momentum": 1.764463405, "flow": 1.700326766}
+    )
+    ordinary.loc[:, "momentum"] = 1_000_000
+    assert ordinary_model.training_scales == pytest.approx(
+        {"momentum": 1.764463405, "flow": 1.700326766}
+    )
+
+
+def test_logistic_prediction_carries_canonical_training_and_feature_provenance() -> None:
+    frame = training_frame().drop(columns="instrument")
+    frame.index = pd.date_range("2026-06-01", periods=len(frame), freq="D", tz="UTC")
+    model = LogisticBaseline(
+        instrument="NIFTY",
+        model_version="logistic-v1",
+        horizon_minutes=15,
+        training_window_id="train-2026-q2",
+    ).fit(frame, ["DOWN"] * 3 + ["NO_MOVE"] * 3 + ["UP"] * 3)
+    base = completed_row()
+    row = base.__class__(
+        **{
+            **base.__dict__,
+            "values": {**base.values, "momentum": 2.5, "flow": 1.5},
+        }
+    )
+
+    result = model.predict_proba(row)
+
+    assert result.feature_available_at == row.available_at
+    assert result.feature_schema_version == "2"
+    assert result.model_version == "logistic-v1"
+    assert result.horizon_minutes == 15
+    assert result.training_window_id == "train-2026-q2"
+    assert str(result.training_window_start.tzinfo) == "Asia/Kolkata"
+    assert str(result.training_window_end.tzinfo) == "Asia/Kolkata"
 
 
 def test_logistic_baseline_keeps_instrument_models_separate() -> None:
