@@ -40,5 +40,7 @@ class ResearchSignal(BaseModel, frozen=True):
     training_window_id: str | None = None
     calibration_id: str | None = None
     calibration_completed_at: datetime | None = None
+    calibration_artifact_validated: bool = False
     validation_report_id: str | None = None
     validation_completed_at: datetime | None = None
+    validation_artifact_promoted: bool = False

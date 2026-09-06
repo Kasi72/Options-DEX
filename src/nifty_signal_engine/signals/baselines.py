@@ -300,10 +300,13 @@ class LogisticBaseline:
         if not frame.columns.is_unique or any(not isinstance(name, str) for name in frame.columns):
             raise ValueError("feature names must be unique strings")
         features = frame.copy()
-        if "instrument" in features:
-            instruments = set(features.pop("instrument"))
-            if instruments != {self.instrument}:
-                raise ValueError("training data must contain a single configured instrument")
+        if "instrument" not in features:
+            raise ValueError("training data requires an explicit instrument column")
+        identities = features.pop("instrument")
+        if identities.isna().any() or any(value not in _INSTRUMENTS for value in identities):
+            raise ValueError("training instrument must be a supported non-null value")
+        if set(identities) != {self.instrument}:
+            raise ValueError("training data must contain a single configured instrument")
         if features.empty:
             raise ValueError("training frame requires numeric features")
         return features

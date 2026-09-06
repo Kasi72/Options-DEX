@@ -113,12 +113,12 @@ def test_logistic_baseline_imputes_from_training_data_and_is_deterministic() -> 
     assert first.calibrated_up is None
 
 
-def test_logistic_baseline_accepts_a_feature_only_row_from_its_training_frame() -> None:
-    frame = training_frame().drop(columns="instrument")
+def test_logistic_baseline_accepts_feature_only_prediction_after_tagged_training() -> None:
+    frame = training_frame()
     model = LogisticBaseline(instrument="NIFTY").fit(
         frame, ["DOWN"] * 3 + ["NO_MOVE"] * 3 + ["UP"] * 3
     )
-    result = model.predict_proba(frame.iloc[-1])
+    result = model.predict_proba(frame.drop(columns="instrument").iloc[-1])
     assert result.instrument == "NIFTY"
     assert result.up > result.down
 
@@ -160,7 +160,7 @@ def test_logistic_scaler_is_train_fitted_and_stable_across_feature_units() -> No
 
 
 def test_logistic_prediction_carries_canonical_training_and_feature_provenance() -> None:
-    frame = training_frame().drop(columns="instrument")
+    frame = training_frame()
     frame.index = pd.date_range("2026-06-01", periods=len(frame), freq="D", tz="UTC")
     model = LogisticBaseline(
         instrument="NIFTY",
@@ -199,6 +199,23 @@ def test_logistic_baseline_keeps_instrument_models_separate() -> None:
         LogisticBaseline(instrument="NIFTY").fit(
             training_frame("BANKNIFTY"),
             ["DOWN"] * 3 + ["NO_MOVE"] * 3 + ["UP"] * 3,
+        )
+
+
+@pytest.mark.parametrize("fault", ["absent", "mixed", "null", "unknown"])
+def test_logistic_fit_requires_one_explicit_matching_instrument(fault: str) -> None:
+    frame = training_frame()
+    if fault == "absent":
+        frame = frame.drop(columns="instrument")
+    elif fault == "mixed":
+        frame.loc[0, "instrument"] = "BANKNIFTY"
+    elif fault == "null":
+        frame.loc[0, "instrument"] = None
+    else:
+        frame.loc[:, "instrument"] = "FINNIFTY"
+    with pytest.raises(ValueError, match="instrument"):
+        LogisticBaseline(instrument="NIFTY").fit(
+            frame, ["DOWN"] * 3 + ["NO_MOVE"] * 3 + ["UP"] * 3
         )
 
 
