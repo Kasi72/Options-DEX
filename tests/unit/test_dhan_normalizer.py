@@ -45,6 +45,23 @@ def test_normalizer_keeps_available_side_when_strike_has_no_put() -> None:
     assert [quote.option_type for quote in at_24400] == ["CE"]
 
 
+def test_normalizer_accepts_dhan_zero_iv_sentinel() -> None:
+    payload = json.loads((FIXTURES / "dhan_option_chain.json").read_text())
+    payload["data"]["oc"]["24300.000000"]["ce"]["implied_volatility"] = 0
+    raw = RawSnapshot(
+        body=json.dumps(payload).encode(),
+        captured_at=datetime(2026, 8, 30, 10, 0, tzinfo=IST),
+        expiry=date(2026, 9, 1),
+    )
+
+    snapshot = normalize_option_chain(
+        raw, "NIFTY", datetime(2026, 8, 30, 10, 1, tzinfo=IST)
+    )
+
+    call = next(quote for quote in snapshot.quotes if quote.strike == 24300)
+    assert call.iv == 0
+
+
 @pytest.mark.parametrize(
     "mutate",
     [

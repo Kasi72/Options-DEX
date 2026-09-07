@@ -97,8 +97,11 @@ def _quote(
     if bid > ask:
         raise BrokerPayloadError("bid cannot exceed ask")
     greeks = _object(side.get("greeks"), "greeks")
+    # Dhan returns ``0`` for contracts where IV is unavailable (commonly
+    # illiquid/deep OTM strikes).  Preserve that as a valid missing-value
+    # sentinel; reject only negative, non-finite, or >100% values.
     iv_percent = _number(
-        side.get("implied_volatility"), "implied_volatility", positive=True
+        side.get("implied_volatility"), "implied_volatility", nonnegative=True
     )
     if iv_percent > 100:
         raise BrokerPayloadError("implied_volatility must be a percentage in (0, 100]")
