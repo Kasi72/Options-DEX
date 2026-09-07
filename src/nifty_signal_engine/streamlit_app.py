@@ -8,16 +8,21 @@ collect data, persist anything, or turn a research result into an order.
 from __future__ import annotations
 
 import json
+import math
+import sqlite3
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal, Protocol, cast
 from zoneinfo import ZoneInfo
 
-from nifty_signal_engine.data.repositories import SnapshotRepository
 from nifty_signal_engine.domain.signal import SignalAction
-from nifty_signal_engine.monitoring.data_quality import DataQualityReport
+from nifty_signal_engine.monitoring.data_quality import (
+    DataQualityCode,
+    DataQualityReport,
+)
 
 try:  # Streamlit is an optional presentation dependency for library users.
     import streamlit as st
@@ -57,6 +62,76 @@ class RepositoryReader(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class LocalReadOnlyRepository:
+    """Read health evidence through SQLite's immutable read-only URI.
+
+    This adapter intentionally does not construct the writer repository. Schema
+    creation and recovery belong to the collection process, not presentation.
+    """
+
+    database: Path
+
+    def _historical_rows(self, instrument: str, session_date: date) -> tuple[sqlite3.Row, ...]:
+        if not self.database.exists():
+            return ()
+        uri = f"file:{self.database.resolve().as_posix()}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                """
+                SELECT n.id, n.source_timestamp, q.tradable, q.codes,
+                       q.details, q.checked_at
+                FROM normalized_snapshots AS n
+                LEFT JOIN quality_decisions AS q
+                  ON q.normalized_snapshot_id = n.id
+                WHERE n.instrument = ? AND n.session_date = ?
+                ORDER BY n.source_timestamp, n.id, q.id
+                """,
+                (instrument, session_date.isoformat()),
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(rows)
+
+    def iter_audited_session(
+        self, instrument: str, session_date: date
+    ) -> Iterable[tuple[object, DataQualityReport]]:
+        selected: dict[int, tuple[str, object, DataQualityReport]] = {}
+        for row in self._historical_rows(instrument, session_date):
+            snapshot_id = int(row["id"])
+            if snapshot_id in selected:
+                continue
+            details = _json_mapping(row["details"])
+            if row["tradable"] is None or details.get("decision_scope") is not None:
+                continue
+            source = _parse_stored_timestamp(row["source_timestamp"])
+            checked = _parse_stored_timestamp(row["checked_at"])
+            report = _stored_quality_report(row["tradable"], row["codes"], details, checked)
+            selected[snapshot_id] = (str(row["source_timestamp"]), SimpleNamespace(source_timestamp=source), report)
+        for _, snapshot, quality in sorted(selected.values(), key=lambda item: item[0]):
+            yield snapshot, quality
+
+    def session_quality_summary(self, instrument: str, session_date: date) -> Mapping[str, object]:
+        audited = tuple(self.iter_audited_session(instrument, session_date))
+        snapshot_ids = {int(row["id"]) for row in self._historical_rows(instrument, session_date)}
+        codes: dict[str, int] = {}
+        tradable_count = 0
+        for _, quality in audited:
+            tradable_count += int(quality.tradable and not quality.codes)
+            for code in quality.codes:
+                codes[code.value] = codes.get(code.value, 0) + 1
+        missing = len(snapshot_ids) - len(audited)
+        if missing > 0:
+            codes[DataQualityCode.QUALITY_MISSING.value] = missing
+        return {
+            "snapshot_count": len(snapshot_ids),
+            "tradable_count": tradable_count,
+            "codes": codes,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class JsonReportReader:
     """Read-only adapter for precomputed replay/walk-forward JSON artifacts."""
 
@@ -65,6 +140,60 @@ class JsonReportReader:
     def reports(self, instrument: str) -> Sequence[Mapping[str, object]]:
         selected = cast(Instrument, instrument)
         return load_reports(self.root, selected)
+
+
+@dataclass(frozen=True, slots=True)
+class JsonFeatureReader:
+    """Read the latest precomputed feature view from local JSON evidence."""
+
+    root: Path
+
+    def latest(self, instrument: str) -> Mapping[str, object] | None:
+        return _latest_json_evidence(self.root, instrument)
+
+
+@dataclass(frozen=True, slots=True)
+class JsonResearchReader:
+    """Read the latest precomputed research probabilities from local evidence."""
+
+    root: Path
+
+    def latest(self, instrument: str) -> Mapping[str, object] | None:
+        return _latest_json_evidence(self.root, instrument)
+
+
+@dataclass(frozen=True, slots=True)
+class SqliteResearchReader:
+    """Read persisted research signal payloads without opening a writer."""
+
+    database: Path
+
+    def latest(self, instrument: str) -> Mapping[str, object] | None:
+        return _latest_sqlite_evidence(self.database, instrument, field=None)
+
+
+@dataclass(frozen=True, slots=True)
+class SqliteFeatureReader:
+    """Read feature views embedded in saved research evidence, if present."""
+
+    database: Path
+
+    def latest(self, instrument: str) -> Mapping[str, object] | None:
+        return _latest_sqlite_evidence(self.database, instrument, field="features")
+
+
+@dataclass(frozen=True, slots=True)
+class ChainedReader:
+    """Try local materialized evidence sources in deterministic priority order."""
+
+    readers: tuple[object, ...]
+
+    def latest(self, instrument: str) -> Mapping[str, object] | None:
+        for reader in self.readers:
+            value = _reader_latest(reader, instrument)
+            if value is not None:
+                return value
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,9 +213,12 @@ class DashboardSnapshot:
     action: Mapping[str, object]
 
 
-def research_action(promotion_metadata: object | None) -> dict[str, object]:
+def research_action(
+    promotion_metadata: object | None, *, blockers: Sequence[str] = ()
+) -> dict[str, object]:
     """Return the UI action, which is always research-only and fail-closed."""
-    reasons = ["RESEARCH_ONLY", "NO_ORDER_SUBMISSION"]
+    reasons = [str(reason) for reason in blockers]
+    reasons.extend(("RESEARCH_ONLY", "NO_ORDER_SUBMISSION"))
     if promotion_metadata is None:
         reasons.insert(0, "MODEL_NOT_PROMOTED")
     else:
@@ -112,19 +244,25 @@ def precision_display(metrics: Mapping[str, object] | object) -> dict[str, objec
     interval = values["precision_ci"]
     if not isinstance(interval, (tuple, list)) or len(interval) != 2:
         return {"precision": None, "reason": "INSUFFICIENT_EVIDENCE"}
+    try:
+        lower, upper = float(interval[0]), float(interval[1])
+    except (TypeError, ValueError, OverflowError):
+        return {"precision": None, "reason": "INVALID_EVIDENCE"}
+    if not math.isfinite(lower) or not math.isfinite(upper) or not 0 <= lower <= upper <= 1:
+        return {"precision": None, "reason": "INVALID_EVIDENCE"}
     coverage, sample_count = values["coverage"], values["sample_count"]
     if not isinstance(coverage, (int, float)) or not 0 <= coverage <= 1:
         return {"precision": None, "reason": "INVALID_EVIDENCE"}
     if isinstance(sample_count, bool) or not isinstance(sample_count, int) or sample_count <= 0:
         return {"precision": None, "reason": "INVALID_EVIDENCE"}
     precision = values.get("precision")
-    if not isinstance(precision, (int, float)):
+    if not isinstance(precision, (int, float)) or not math.isfinite(float(precision)):
         return {"precision": None, "reason": "INSUFFICIENT_EVIDENCE"}
     return {
         "precision": float(precision),
         "coverage": float(coverage),
         "sample_count": sample_count,
-        "precision_ci": (float(interval[0]), float(interval[1])),
+        "precision_ci": (lower, upper),
         "evaluation_window": str(values["evaluation_window"]),
         "reason": None,
     }
@@ -169,9 +307,22 @@ def build_dashboard_snapshot(
         except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
             health.update({"status": "UNAVAILABLE", "error": type(error).__name__})
 
-    feature = _reader_latest(feature_reader, instrument)
-    research = _reader_latest(research_reader, instrument)
-    reports = tuple(report_reader.reports(instrument)) if report_reader is not None else ()
+    quality_ok = (
+        health.get("status") == "HEALTHY"
+        and _count(health.get("snapshot_count", 0)) > 0
+        and _count(health.get("tradable_count", 0))
+        == _count(health.get("snapshot_count", 0))
+        and last_valid_source_time is not None
+    )
+    feature = _reader_latest(feature_reader, instrument) if quality_ok else None
+    research = _reader_latest(research_reader, instrument) if quality_ok else None
+    reports_raw = tuple(report_reader.reports(instrument)) if report_reader is not None else ()
+    reports = tuple(
+        dict(report)
+        for report in reports_raw
+        if isinstance(report, Mapping) and report.get("instrument") == instrument
+    )
+    blockers = () if quality_ok else tuple(_quality_blockers(health))
     return DashboardSnapshot(
         instrument=instrument,
         session_date=session_date,
@@ -183,7 +334,9 @@ def build_dashboard_snapshot(
         zero_levels=_layer(feature, "zero_levels"),
         probabilities=_layer(research, "probabilities"),
         reports=reports,
-        action=research_action(_layer(research, "promotion_metadata") or None),
+        action=research_action(
+            _layer(research, "promotion_metadata") or None, blockers=blockers
+        ),
     )
 
 
@@ -212,20 +365,22 @@ def main() -> None:
     selected_date = selected if isinstance(selected, date) else today
     data_dir = Path(".nifty-signal-data")
     database = data_dir / "market.sqlite3"
-    repository: SnapshotRepository | None = None
+    repository: LocalReadOnlyRepository | None = None
     if database.exists():
-        repository = SnapshotRepository(database_path=database, parquet_root=data_dir / "parquet")
-    try:
-        view = build_dashboard_snapshot(
-            repository,
-            instrument,
-            selected_date,
-            report_reader=JsonReportReader(data_dir / "reports"),
-        )
-        render_dashboard(view)
-    finally:
-        if repository is not None:
-            repository.close()
+        repository = LocalReadOnlyRepository(database)
+    view = build_dashboard_snapshot(
+        repository,
+        instrument,
+        selected_date,
+        feature_reader=ChainedReader(
+            (JsonFeatureReader(data_dir / "features"), SqliteFeatureReader(database))
+        ),
+        research_reader=ChainedReader(
+            (JsonResearchReader(data_dir / "research"), SqliteResearchReader(database))
+        ),
+        report_reader=JsonReportReader(data_dir / "reports"),
+    )
+    render_dashboard(view)
 
 
 def _streamlit() -> Any:
@@ -249,12 +404,139 @@ def _reader_latest(reader: object | None, instrument: str) -> Mapping[str, objec
         return None
     latest = getattr(reader, "latest", None)
     value = latest(instrument) if callable(latest) else None
-    return value if isinstance(value, Mapping) else None
+    if not isinstance(value, Mapping) or value.get("instrument") != instrument:
+        return None
+    quality = value.get("quality")
+    if isinstance(quality, Mapping) and (
+        quality.get("tradable") is not True or quality.get("codes")
+    ):
+        return None
+    return value
+
+
+def _quality_blockers(health: Mapping[str, object]) -> tuple[str, ...]:
+    codes = health.get("codes")
+    if isinstance(codes, Mapping) and codes:
+        return tuple(str(code) for code in codes)
+    return ("QUALITY_NOT_VALID",)
 
 
 def _layer(value: Mapping[str, object] | None, name: str) -> Mapping[str, object]:
     nested = value.get(name) if value is not None else None
     return dict(nested) if isinstance(nested, Mapping) else {}
+
+
+def _json_mapping(value: object) -> dict[str, object]:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return {str(key): item for key, item in parsed.items()} if isinstance(parsed, Mapping) else {}
+    return {str(key): item for key, item in value.items()} if isinstance(value, Mapping) else {}
+
+
+def _parse_stored_timestamp(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise TypeError("stored timestamp is unavailable")
+    timestamp = datetime.fromisoformat(value)
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("stored timestamp is naïve")
+    return timestamp.astimezone(IST)
+
+
+def _stored_quality_report(
+    tradable: object, codes: object, details: Mapping[str, object], checked_at: datetime
+) -> DataQualityReport:
+    parsed_codes: list[DataQualityCode] = []
+    if isinstance(codes, str):
+        try:
+            raw_codes: object = json.loads(codes)
+        except json.JSONDecodeError:
+            raw_codes = codes
+    else:
+        raw_codes = codes
+    if isinstance(raw_codes, list):
+        for value in raw_codes:
+            try:
+                parsed_codes.append(DataQualityCode(str(value)))
+            except ValueError:
+                parsed_codes.append(DataQualityCode.QUALITY_MISSING)
+    elif raw_codes:
+        parsed_codes.append(DataQualityCode.QUALITY_MISSING)
+    normalized_details = {str(key): str(value) for key, value in details.items()}
+    return DataQualityReport(
+        tradable=bool(tradable),
+        codes=tuple(dict.fromkeys(parsed_codes)),
+        checked_at=checked_at,
+        details=normalized_details,
+    )
+
+
+def _latest_json_evidence(root: Path, instrument: str) -> Mapping[str, object] | None:
+    if not root.exists() or not root.is_dir():
+        return None
+    candidates: list[tuple[datetime, Mapping[str, object]]] = []
+    for path in sorted(root.glob("*.json")):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        value = _normalise_evidence(value)
+        if value is None or value.get("instrument") != instrument:
+            continue
+        timestamp_value = value.get("available_at", value.get("created_at", value.get("as_of")))
+        try:
+            timestamp = _parse_stored_timestamp(timestamp_value)
+        except (TypeError, ValueError):
+            continue
+        candidates.append((timestamp, dict(value)))
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
+def _normalise_evidence(value: object) -> Mapping[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    payload = value.get("payload")
+    if isinstance(payload, Mapping):
+        merged = dict(payload)
+        for key in ("instrument", "available_at", "created_at", "as_of"):
+            if key in value:
+                merged.setdefault(key, value[key])
+        return {str(key): item for key, item in merged.items()}
+    return {str(key): item for key, item in value.items()}
+
+
+def _latest_sqlite_evidence(
+    database: Path, instrument: str, *, field: str | None
+) -> Mapping[str, object] | None:
+    if not database.exists():
+        return None
+    uri = f"file:{database.resolve().as_posix()}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        rows = connection.execute(
+            "SELECT payload, created_at FROM research_signals ORDER BY created_at DESC, signal_id DESC"
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+    for payload, created_at in rows:
+        try:
+            parsed = _normalise_evidence(json.loads(payload) if isinstance(payload, str) else payload)
+            timestamp = _parse_stored_timestamp(created_at)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if parsed is None or parsed.get("instrument") != instrument:
+            continue
+        if field is not None:
+            selected = parsed.get(field)
+            if not isinstance(selected, Mapping):
+                continue
+            return {"instrument": instrument, **dict(selected), "available_at": timestamp.isoformat()}
+        return dict(parsed)
+    return None
 
 
 def _render_health(streamlit: Any, snapshot: DashboardSnapshot) -> None:
@@ -351,6 +633,16 @@ def _format_number(value: object) -> str:
     return "—"
 
 
+def _count(value: object) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return 0
+
+
 def load_reports(report_root: Path, instrument: Instrument) -> tuple[Mapping[str, object], ...]:
     """Load precomputed JSON reports without treating them as executable input."""
     if not report_root.exists() or not report_root.is_dir():
@@ -361,7 +653,7 @@ def load_reports(report_root: Path, instrument: Instrument) -> tuple[Mapping[str
             value = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
-        if isinstance(value, Mapping) and (value.get("instrument") in (None, instrument)):
+        if isinstance(value, Mapping) and value.get("instrument") == instrument:
             reports.append(dict(value))
     return tuple(reports)
 

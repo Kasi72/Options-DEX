@@ -25,11 +25,14 @@ broker credentials.
 
 ```powershell
 nifty-signal collect-once --fixture tests/fixtures/dhan_option_chain.json --instrument NIFTY
-nifty-signal inspect-session --instrument NIFTY --date 2026-08-26
-nifty-signal replay --instrument NIFTY --date 2026-08-26
-nifty-signal walk-forward --instrument NIFTY --horizon 30min
+nifty-signal inspect-session --instrument NIFTY --session-date 2026-08-26
 streamlit run src/nifty_signal_engine/streamlit_app.py
 ```
+
+Replay and walk-forward reports are read-only artifacts selected in the
+dashboard when produced by their respective backtesting services; those
+services are not collector commands and are intentionally not re-run by the
+UI.
 
 The current action is explicitly `RESEARCH/NO_TRADE` until independently
 verified chronological validation and shadow-promotion metadata exist. Full
