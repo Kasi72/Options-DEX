@@ -220,17 +220,27 @@ class DashboardSnapshot:
 
 
 def research_action(
-    promotion_metadata: object | None, *, blockers: Sequence[str] = ()
+    promotion_metadata: object | None,
+    *,
+    blockers: Sequence[str] = (),
+    mode: str = "RESEARCH",
 ) -> dict[str, object]:
-    """Return the UI action, which is always research-only and fail-closed."""
+    """Return a fail-closed manual signal action.
+
+    ``LIVE_SIGNAL`` enables real-time recommendations for manual execution;
+    it deliberately has no broker order-submission path.
+    """
     reasons = [str(reason) for reason in blockers]
-    reasons.extend(("RESEARCH_ONLY", "NO_ORDER_SUBMISSION"))
+    if mode == "LIVE_SIGNAL":
+        reasons.append("MANUAL_EXECUTION_ONLY")
+    else:
+        reasons.extend(("RESEARCH_ONLY", "NO_ORDER_SUBMISSION"))
     if promotion_metadata is None:
         reasons.insert(0, "MODEL_NOT_PROMOTED")
     else:
         reasons.insert(0, "PROMOTION_METADATA_IS_NOT_EXECUTION_AUTHORITY")
     return {
-        "mode": "RESEARCH",
+        "mode": mode,
         "action": SignalAction.NO_TRADE.value,
         "reasons": tuple(reasons),
     }
@@ -344,7 +354,9 @@ def build_dashboard_snapshot(
         probabilities=_layer(research, "probabilities"),
         reports=reports,
         action=research_action(
-            _layer(research, "promotion_metadata") or None, blockers=blockers
+            _layer(research, "promotion_metadata") or None,
+            blockers=blockers,
+            mode="LIVE_SIGNAL",
         ),
     )
 
@@ -353,7 +365,7 @@ def render_dashboard(snapshot: DashboardSnapshot) -> None:
     """Render all research panels for an already assembled view-model."""
     streamlit = _streamlit()
     streamlit.title("NIFTY / BANKNIFTY options research")
-    streamlit.caption("Research and shadow monitoring only — no live execution")
+    streamlit.caption("Live signal mode — manual execution only; no orders are submitted")
     streamlit.subheader(f"{snapshot.instrument} · {snapshot.session_date.isoformat()}")
 
     _render_health(streamlit, snapshot)

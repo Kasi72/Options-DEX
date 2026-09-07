@@ -4,7 +4,7 @@
 
 Precision-first research infrastructure for NIFTY and BANKNIFTY options. The engine converts timestamped option-chain observations into auditable exposures, Greeks, zero-levels, causal features, calibrated directional research, realistic replay results, and walk-forward validation reports.
 
-> **Current status:** research and shadow-monitoring only. Every public signal is explicitly `RESEARCH / NO_TRADE`. No broker credentials, order submission, or live execution path is included.
+> **Current status:** live signal mode for manual execution. The dashboard can expose validated BUY/SELL recommendations when governance gates pass; it never submits broker orders.
 
 ## What it provides
 
