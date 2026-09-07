@@ -32,6 +32,7 @@ class QualityConfig:
     require_authoritative_source_time: bool = True
     require_authoritative_quote_time: bool = True
     require_valid_iv: bool = True
+    require_reasonable_spread: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,9 +185,8 @@ def assess_snapshot(
         add(DataQualityCode.ZERO_VOLUME, "volume", "zero_cumulative_volume")
     if any(not _quote_is_valid(quote) for quote in current.quotes):
         add(DataQualityCode.INVALID_QUOTE, "quote", "missing_or_invalid_bid_ask")
-    if any(
-        _spread_is_excessive(quote, config.maximum_relative_spread)
-        for quote in current.quotes
+    if config.require_reasonable_spread and any(
+        _spread_is_excessive(quote, config.maximum_relative_spread) for quote in current.quotes
     ):
         add(DataQualityCode.EXCESSIVE_SPREAD, "spread", "relative_spread_exceeds_limit")
     if config.require_valid_iv and any(not _iv_is_valid(quote) for quote in current.quotes):

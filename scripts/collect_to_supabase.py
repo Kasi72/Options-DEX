@@ -76,6 +76,7 @@ async def collect(instrument: Instrument) -> None:
             require_authoritative_source_time=False,
             require_authoritative_quote_time=False,
             require_valid_iv=False,
+            require_reasonable_spread=False,
         ),
     )
     row = snapshot_row(
