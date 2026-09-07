@@ -24,7 +24,12 @@ class SupabaseConfigurationError(RuntimeError):
     """Required Supabase settings are missing or malformed."""
 
 
-@dataclass(frozen=True, slots=True)
+# Streamlit Cloud currently executes the entrypoint through a loader that may
+# not register this module in ``sys.modules`` before applying ``dataclass``.
+# ``slots=True`` asks dataclasses to resolve postponed annotations through that
+# module and raises an AttributeError there.  Frozen semantics are retained;
+# regular dataclass layout keeps the adapter compatible with that loader.
+@dataclass(frozen=True)
 class SupabaseRestSettings:
     url: str
     key: str
