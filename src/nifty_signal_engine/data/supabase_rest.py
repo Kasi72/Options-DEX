@@ -178,10 +178,16 @@ class SupabaseSnapshotReader:
                 tradable += 1
             for code in report.codes:
                 codes[code.value] = codes.get(code.value, 0) + 1
+        latest_codes = {
+            code.value: 1 for code in (latest_report.codes if latest_report else ())
+        }
         return {
             "snapshot_count": len(rows),
             "tradable_count": tradable,
-            "codes": codes,
+            # ``codes`` is intentionally current-state only; older rejected
+            # observations belong in the diagnostic history field.
+            "codes": latest_codes,
+            "historical_codes": codes,
             "latest_tradable": bool(latest_report and latest_report.tradable and not latest_report.codes),
             "latest_codes": [code.value for code in latest_report.codes] if latest_report else [],
         }
