@@ -67,9 +67,6 @@ def test_normalizer_accepts_dhan_zero_iv_sentinel() -> None:
     [
         lambda payload: payload["data"].pop("last_price"),
         lambda payload: payload["data"]["oc"].__setitem__("not-a-strike", {}),
-        lambda payload: payload["data"]["oc"]["24300.000000"]["ce"].__setitem__(
-            "implied_volatility", 150.0
-        ),
     ],
 )
 def test_normalizer_rejects_malformed_or_ambiguous_quotes(mutate) -> None:
@@ -83,6 +80,22 @@ def test_normalizer_rejects_malformed_or_ambiguous_quotes(mutate) -> None:
 
     with pytest.raises(BrokerPayloadError):
         normalize_option_chain(raw, "NIFTY", datetime(2026, 8, 30, 10, 1, tzinfo=IST))
+
+
+def test_normalizer_quarantines_outlier_iv_without_dropping_chain() -> None:
+    payload = json.loads((FIXTURES / "dhan_option_chain.json").read_text())
+    payload["data"]["oc"]["24300.000000"]["ce"]["implied_volatility"] = 150.0
+    raw = RawSnapshot(
+        body=json.dumps(payload).encode(),
+        captured_at=datetime(2026, 8, 30, 10, 0, tzinfo=IST),
+        expiry=date(2026, 9, 1),
+    )
+    snapshot = normalize_option_chain(
+        raw, "NIFTY", datetime(2026, 8, 30, 10, 1, tzinfo=IST)
+    )
+    call = next(quote for quote in snapshot.quotes if quote.strike == 24300)
+    assert call.iv is None
+    assert len(snapshot.quotes) > 1
 
 
 def test_normalizer_rejects_naive_received_timestamp() -> None:

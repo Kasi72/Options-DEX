@@ -103,8 +103,10 @@ def _quote(
     iv_percent = _number(
         side.get("implied_volatility"), "implied_volatility", nonnegative=True
     )
-    if iv_percent > 100:
-        raise BrokerPayloadError("implied_volatility must be a percentage in (0, 100]")
+    # A broker can occasionally emit a stale/invalid IV for one contract.
+    # Keep the rest of the chain usable and let data-quality gates exclude
+    # this quote from calculations rather than dropping the entire snapshot.
+    iv = iv_percent / 100 if 0 < iv_percent <= 100 else None
     return OptionQuote(
         timestamp=timestamp,
         timestamp_authoritative=timestamp_authoritative,
@@ -117,7 +119,7 @@ def _quote(
         volume=_integer(side.get("volume"), "volume", nonnegative=True),
         oi=_integer(side.get("oi"), "oi", nonnegative=True),
         previous_oi=_integer(side.get("previous_oi"), "previous_oi", nonnegative=True),
-        iv=iv_percent / 100,
+        iv=iv,
         api_delta=_number(greeks.get("delta"), "greeks.delta"),
         api_gamma=_number(greeks.get("gamma"), "greeks.gamma", nonnegative=True),
     )
