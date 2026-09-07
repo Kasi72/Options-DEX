@@ -171,9 +171,17 @@ class SupabaseSnapshotReader:
         rows = self._rows(instrument, session_date)
         codes: dict[str, int] = {}
         tradable = 0
-        for _, report in self.iter_audited_session(instrument, session_date):
+        audited = tuple(self.iter_audited_session(instrument, session_date))
+        latest_report = audited[-1][1] if audited else None
+        for _, report in audited:
             if report.tradable and not report.codes:
                 tradable += 1
             for code in report.codes:
                 codes[code.value] = codes.get(code.value, 0) + 1
-        return {"snapshot_count": len(rows), "tradable_count": tradable, "codes": codes}
+        return {
+            "snapshot_count": len(rows),
+            "tradable_count": tradable,
+            "codes": codes,
+            "latest_tradable": bool(latest_report and latest_report.tradable and not latest_report.codes),
+            "latest_codes": [code.value for code in latest_report.codes] if latest_report else [],
+        }

@@ -297,7 +297,11 @@ def build_dashboard_snapshot(
             summary = repository.session_quality_summary(instrument, session_date)
             if isinstance(summary, Mapping):
                 health.update({str(key): value for key, value in summary.items()})
-                health["status"] = "HEALTHY" if not summary.get("codes") else "QUALITY_REVIEW"
+                # Historical rejected snapshots remain visible in the counts,
+                # but status reflects whether the newest observation is usable.
+                health["status"] = (
+                    "HEALTHY" if summary.get("latest_tradable") else "QUALITY_REVIEW"
+                )
             audited = tuple(repository.iter_audited_session(instrument, session_date))
             for snapshot, quality in audited:
                 timestamp = getattr(snapshot, "source_timestamp", None)
@@ -316,8 +320,7 @@ def build_dashboard_snapshot(
     quality_ok = (
         health.get("status") == "HEALTHY"
         and _count(health.get("snapshot_count", 0)) > 0
-        and _count(health.get("tradable_count", 0))
-        == _count(health.get("snapshot_count", 0))
+        and bool(health.get("latest_tradable"))
         and last_valid_source_time is not None
     )
     feature = _reader_latest(feature_reader, instrument) if quality_ok else None
