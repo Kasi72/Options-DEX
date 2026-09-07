@@ -13,6 +13,7 @@ Precision-first research infrastructure for NIFTY and BANKNIFTY options. The eng
 - Immutable raw evidence, quality decisions, restart-safe collection, SQLite/WAL persistence, and Parquet exports.
 - Black–Scholes Greeks, gamma/delta exposure, zero-level/root analysis, rolling baselines, and session-aware features.
 - Causal labels and selective BUY/SELL research predictions with abstention, quality gates, and separate instrument models.
+- Transparent regime classification (trend-up, trend-down, range, high-volatility) and a disagreement-scored probability ensemble for selective model gating.
 - Deterministic replay with quote chronology checks, bid/ask-bounded fills, slippage, and explicit INR costs.
 - Purged, embargoed, IST walk-forward validation with calibration, precision/coverage, confidence intervals, drawdown, and cost-aware economics.
 - Registry-backed promotion artifacts for a future governed promotion phase.

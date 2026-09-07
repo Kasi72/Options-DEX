@@ -4,6 +4,9 @@ All notable changes to NIFTY Signal Engine are documented here. The project is p
 
 ## [Unreleased]
 
+- Added deterministic, fail-closed market-regime classification for completed feature rows.
+- Added weighted directional probability blending with pairwise model-disagreement scoring.
+- Added unit coverage for regime warm-up, trend detection, ensemble disagreement, and instrument isolation.
 - Future: connect verified promotion artifacts to a governed shadow-to-live promotion process.
 - Future: add longer authoritative multi-session NIFTY/BANKNIFTY datasets and production feed adapters.
 - Future: add deployment packaging, observability, and authenticated multi-user web access.
