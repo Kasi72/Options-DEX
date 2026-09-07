@@ -6,6 +6,21 @@ Precision-first research infrastructure for NIFTY and BANKNIFTY options. The eng
 
 > **Current status:** live signal mode for manual execution. The dashboard can expose validated BUY/SELL recommendations when governance gates pass; it never submits broker orders.
 
+### Free local collector
+
+If an always-on VPS is not available, run the collector on a powered-on
+computer during NSE hours. From the repository root, configure the four
+environment variables used by the collector and run:
+
+```bash
+python scripts/run_collector_loop.py
+```
+
+The runner polls NIFTY and BANKNIFTY once per minute on weekdays between
+09:15 and 15:30 IST, pauses outside the session, retries transient failures,
+and stores snapshots in Supabase. It never places orders. Keep the terminal
+open (or configure Windows Task Scheduler/systemd to start it at login).
+
 ## What it provides
 
 - Strict, timezone-aware domain models for NIFTY and BANKNIFTY.
