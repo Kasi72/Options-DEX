@@ -72,7 +72,7 @@ async def collect(instrument: Instrument) -> None:
         calendar=TradingCalendar({snapshot.source_timestamp.date()}),
         active_expiries=expiries,
         config=QualityConfig(
-            maximum_relative_spread=1.0,
+            maximum_relative_spread=10.0,
             require_authoritative_source_time=False,
             require_authoritative_quote_time=False,
             require_valid_iv=False,
