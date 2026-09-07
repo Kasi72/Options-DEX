@@ -47,6 +47,38 @@ streamlit run src/nifty_signal_engine/streamlit_app.py
 
 The dashboard reads persisted JSON/SQLite research artifacts. It does not collect data, migrate schemas, delete files, call a broker, or submit orders.
 
+## Supabase + scheduled Dhan collection
+
+The repository includes a privilege-separated cloud path. Apply
+`supabase/migrations/20260907000000_market_data.sql` in your Supabase SQL
+editor. The migration enables RLS and grants the public dashboard read access
+only to published rows. The scheduled collector uses the service-role key only
+inside the scheduler to insert market snapshots; never place that key in
+Streamlit Secrets or browser code.
+
+Configure these GitHub Actions secrets:
+
+```text
+DHAN_CLIENT_ID
+DHAN_ACCESS_TOKEN
+SUPABASE_URL
+SUPABASE_SERVICE_ROLE_KEY
+```
+
+The workflow in `.github/workflows/collect-market-data.yml` runs every five
+minutes on weekdays and can also be started manually. Configure these
+Streamlit Cloud secrets for the read-only dashboard:
+
+```toml
+SUPABASE_URL = "https://<project-ref>.supabase.co"
+SUPABASE_ANON_KEY = "<publishable-or-anon-key>"
+```
+
+The collector currently publishes audited market snapshots and provenance.
+Feature/research artifacts remain governed outputs and are shown only when
+their own validated artifacts exist. Supabase Cron or another scheduler can be
+used instead of GitHub Actions if preferred.
+
 ## Data and provenance
 
 Raw observations are persisted before normalization or feature calculation. Each downstream artifact carries instrument, observation/availability timestamps, source provenance, schema/version information, and quality decisions. CSV is an export format only; SQLite and partitioned Parquet are the analytical sources of truth.

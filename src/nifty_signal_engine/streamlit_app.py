@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sqlite3
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -18,6 +19,11 @@ from types import SimpleNamespace
 from typing import Any, Literal, Protocol, cast
 from zoneinfo import ZoneInfo
 
+from nifty_signal_engine.data.supabase_rest import (
+    SupabaseRestClient,
+    SupabaseRestSettings,
+    SupabaseSnapshotReader,
+)
 from nifty_signal_engine.domain.signal import SignalAction
 from nifty_signal_engine.monitoring.data_quality import (
     DataQualityCode,
@@ -365,8 +371,11 @@ def main() -> None:
     selected_date = selected if isinstance(selected, date) else today
     data_dir = Path(".nifty-signal-data")
     database = data_dir / "market.sqlite3"
-    repository: LocalReadOnlyRepository | None = None
-    if database.exists():
+    repository: RepositoryReader | None = None
+    supabase_settings = _streamlit_supabase_settings(streamlit)
+    if supabase_settings is not None:
+        repository = SupabaseSnapshotReader(SupabaseRestClient(supabase_settings))
+    elif database.exists():
         repository = LocalReadOnlyRepository(database)
     view = build_dashboard_snapshot(
         repository,
@@ -381,6 +390,20 @@ def main() -> None:
         report_reader=JsonReportReader(data_dir / "reports"),
     )
     render_dashboard(view)
+
+
+def _streamlit_supabase_settings(streamlit: Any) -> SupabaseRestSettings | None:
+    """Read only the publishable Supabase key from Streamlit Secrets."""
+    try:
+        url = str(streamlit.secrets.get("SUPABASE_URL", os.environ.get("SUPABASE_URL", ""))).strip()
+        key = str(streamlit.secrets.get("SUPABASE_ANON_KEY", os.environ.get("SUPABASE_ANON_KEY", ""))).strip()
+    except (AttributeError, KeyError, TypeError):
+        return None
+    if not url and not key:
+        return None
+    if not url or not key:
+        return None
+    return SupabaseRestSettings(url=url.rstrip("/"), key=key)
 
 
 def _streamlit() -> Any:
