@@ -59,7 +59,7 @@ def test_normalizer_accepts_dhan_zero_iv_sentinel() -> None:
     )
 
     call = next(quote for quote in snapshot.quotes if quote.strike == 24300)
-    assert call.iv == 0
+    assert call.iv is None
 
 
 @pytest.mark.parametrize(
