@@ -32,6 +32,8 @@ def test_cost_breakdown_names_every_configured_component() -> None:
     )
 
     assert breakdown.version == "fixture-v1"
+    assert breakdown.currency == "INR"
+    assert breakdown.brokerage_rupees == pytest.approx(1.01)
     assert breakdown.brokerage == pytest.approx(1.01)
     assert breakdown.exchange_charges == pytest.approx(2.02)
     assert breakdown.taxes == 0
@@ -40,7 +42,17 @@ def test_cost_breakdown_names_every_configured_component() -> None:
     assert breakdown.stamp_duty == pytest.approx(0.202)
     assert breakdown.spread == pytest.approx(10)
     assert breakdown.extra_slippage == pytest.approx(0.505)
-    assert breakdown.total == pytest.approx(sum(breakdown.components.values()))
+    assert breakdown.total_rupees == pytest.approx(sum(breakdown.components.values()))
+    assert set(breakdown.components) == {
+        "brokerage_rupees",
+        "exchange_charges_rupees",
+        "taxes_rupees",
+        "gst_rupees",
+        "regulatory_fees_rupees",
+        "stamp_duty_rupees",
+        "spread_rupees",
+        "extra_slippage_rupees",
+    }
 
 
 def test_schedule_report_exposes_the_version_and_all_rates() -> None:
@@ -50,3 +62,5 @@ def test_schedule_report_exposes_the_version_and_all_rates() -> None:
 
     assert report["version"] == "zero-rates-for-test"
     assert report["rates"] == rates.as_dict()
+    assert report["currency"] == "INR"
+    assert report["monetary_unit"] == "rupees"

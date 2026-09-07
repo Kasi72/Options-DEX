@@ -164,6 +164,12 @@ class FeaturePipeline:
         self._completed: list[FeatureRow] = []
         self.last_rejection_codes: tuple[str, ...] = ()
 
+    def reset(self) -> None:
+        """Discard all derived state before an independent deterministic replay."""
+        self._states.clear()
+        self._completed.clear()
+        self.last_rejection_codes = ()
+
     def drain_completed(self) -> tuple[FeatureRow, ...]:
         result = tuple(self._completed)
         self._completed.clear()

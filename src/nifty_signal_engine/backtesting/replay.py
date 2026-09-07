@@ -52,9 +52,9 @@ class ReplayEvent:
         if self.snapshot.source_timestamp.tzinfo is None:
             raise ValueError("snapshot source timestamp must be timezone-aware")
         if any(
-            quote.timestamp < self.snapshot.source_timestamp for quote in self.quotes
+            quote.timestamp > self.snapshot.source_timestamp for quote in self.quotes
         ):
-            raise ValueError("executable quote predates its replay event")
+            raise ValueError("executable quote is future to its replay event")
         quote_times = tuple(quote.timestamp for quote in self.quotes)
         if any(
             current < previous for previous, current in pairwise(quote_times)
@@ -98,6 +98,7 @@ class ReplayEngine:
         if not isinstance(session, ReplaySession):
             raise TypeError("session must be ReplaySession")
         self._validate_chronology(session.events)
+        self.pipeline.reset()
         pending = list(session.candidates)
         feature_rows: list[FeatureRow] = []
         signals: list[object] = []
@@ -107,13 +108,29 @@ class ReplayEngine:
 
         for event in session.events:
             self.pipeline.on_snapshot(event.snapshot, event.quality)
+            accepted = self._event_accepted(event)
+            if not accepted:
+                code = (
+                    RejectionCode.NON_TRADABLE_EVENT
+                    if not event.quality.tradable or event.quality.codes
+                    else RejectionCode.REJECTED_EVENT
+                )
+                rejections.extend(Rejection(candidate, code) for candidate in pending)
+                pending.clear()
+                continue
             rows = self.pipeline.drain_completed()
             feature_rows.extend(rows)
             for row in rows:
                 outcome = self._signal(row, event.quality)
                 if outcome is not None:
                     signals.append(outcome)
-                    pending.extend(self._candidates(outcome))
+                    for candidate in self._candidates(outcome):
+                        if candidate.signal_time < row.available_at:
+                            rejections.append(
+                                Rejection(candidate, RejectionCode.LOOKAHEAD_SIGNAL_TIME)
+                            )
+                        else:
+                            pending.append(candidate)
             pending = self._fill_pending(
                 pending, event.quotes, fills, rejections, costs
             )
@@ -134,11 +151,21 @@ class ReplayEngine:
     @staticmethod
     def _validate_chronology(events: tuple[ReplayEvent, ...]) -> None:
         previous: datetime | None = None
+        previous_quote: datetime | None = None
         for event in events:
             timestamp = event.snapshot.source_timestamp
             if previous is not None and timestamp <= previous:
                 raise ValueError("replay events must be strictly chronological")
             previous = timestamp
+            for quote in event.quotes:
+                if previous_quote is not None and quote.timestamp < previous_quote:
+                    raise ValueError("replay quote chronology regressed")
+                previous_quote = quote.timestamp
+
+    def _event_accepted(self, event: ReplayEvent) -> bool:
+        if not event.quality.tradable or event.quality.codes:
+            return False
+        return self.pipeline.last_rejection_codes in ((), ("WARMUP",))
 
     def _signal(self, row: FeatureRow, quality: DataQualityReport) -> object | None:
         service = self.signal_service

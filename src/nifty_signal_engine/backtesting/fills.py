@@ -38,8 +38,12 @@ class TradeCandidate:
         )
         if not isinstance(self.contract_id, str) or not self.contract_id.strip():
             raise ValueError("contract_id must not be blank")
-        if isinstance(self.quantity, bool) or self.quantity <= 0:
-            raise ValueError("quantity must be positive")
+        if (
+            isinstance(self.quantity, bool)
+            or not isinstance(self.quantity, int)
+            or self.quantity <= 0
+        ):
+            raise ValueError("quantity must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +70,9 @@ class RejectionCode(StrEnum):
     NOT_NEXT_QUOTE = "NOT_NEXT_QUOTE"
     CONTRACT_MISMATCH = "CONTRACT_MISMATCH"
     NO_EXECUTABLE_QUOTE = "NO_EXECUTABLE_QUOTE"
+    NON_TRADABLE_EVENT = "NON_TRADABLE_EVENT"
+    REJECTED_EVENT = "REJECTED_EVENT"
+    LOOKAHEAD_SIGNAL_TIME = "LOOKAHEAD_SIGNAL_TIME"
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,8 +99,14 @@ class Fill:
             raise ValueError("fill must contain a valid executable quote")
         if self.executed_at <= self.candidate.signal_time:
             raise ValueError("fill must follow its signal")
-        if self.quantity != self.candidate.quantity:
+        if (
+            isinstance(self.quantity, bool)
+            or not isinstance(self.quantity, int)
+            or self.quantity != self.candidate.quantity
+        ):
             raise ValueError("fill quantity must equal candidate quantity")
+        if not self.bid <= self.price <= self.ask:
+            raise ValueError("fill price must be within bid/ask bounds")
 
 
 @dataclass(frozen=True, slots=True)

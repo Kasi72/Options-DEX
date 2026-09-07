@@ -15,3 +15,18 @@ Verification completed:
 - `py -m mypy src` — passed (38 source files).
 
 `py -m mypy src tests` remains blocked by the repository's existing duplicate-module discovery of `tests/factories.py` as both `factories` and `tests.factories`; this task introduces no mypy errors in the backtesting package.
+
+## Independent-review correction
+
+- A failed quality gate or `FeaturePipeline` rejection now cancels every pending candidate with an explicit rejection; no quote from that event can fill an intent.
+- Replay events reject future quotes, validate quote order both within and across events, and reset feature-pipeline state at the start of each run so the same engine/session produces the same result twice.
+- Candidates emitted before their source feature row becomes available are rejected as `LOOKAHEAD_SIGNAL_TIME`.
+- `CostBreakdown` component and total fields now carry explicit `_rupees` names and an `INR` currency contract. Schedule reports state `currency=INR` and `monetary_unit=rupees`.
+- Candidates and fills require integral positive quantities; fill prices must remain within their recorded bid/ask range.
+
+Correction verification:
+
+- `py -m pytest tests/unit/test_costs.py tests/unit/test_fills.py tests/integration/test_event_replay.py -v` — 18 passed.
+- `py -m pytest -v` — 279 passed.
+- `py -m ruff check .` — passed.
+- `py -m mypy src` — passed (38 source files).

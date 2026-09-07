@@ -54,8 +54,12 @@ class CostedTrade:
 
     def __post_init__(self) -> None:
         quantity = self.entry.quantity if self.quantity is None else self.quantity
-        if isinstance(quantity, bool) or quantity <= 0:
-            raise ValueError("quantity must be positive")
+        if (
+            isinstance(quantity, bool)
+            or not isinstance(quantity, int)
+            or quantity <= 0
+        ):
+            raise ValueError("quantity must be a positive integer")
         if quantity != self.entry.quantity:
             raise ValueError("cost trade quantity must equal entry quantity")
         if self.exit is not None:
@@ -89,33 +93,80 @@ class CostedTrade:
 @dataclass(frozen=True, slots=True)
 class CostBreakdown:
     version: str
-    brokerage: float
-    exchange_charges: float
-    taxes: float
-    gst: float
-    regulatory_fees: float
-    stamp_duty: float
-    spread: float
-    extra_slippage: float
+    brokerage_rupees: float
+    exchange_charges_rupees: float
+    taxes_rupees: float
+    gst_rupees: float
+    regulatory_fees_rupees: float
+    stamp_duty_rupees: float
+    spread_rupees: float
+    extra_slippage_rupees: float
+    currency: str = "INR"
+
+    def __post_init__(self) -> None:
+        if self.currency != "INR":
+            raise ValueError("cost currency must be INR")
+        for field in self.components:
+            value = getattr(self, field)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{field} must be finite and non-negative")
 
     @property
     def components(self) -> Mapping[str, float]:
         return MappingProxyType(
             {
-                "brokerage": self.brokerage,
-                "exchange_charges": self.exchange_charges,
-                "taxes": self.taxes,
-                "gst": self.gst,
-                "regulatory_fees": self.regulatory_fees,
-                "stamp_duty": self.stamp_duty,
-                "spread": self.spread,
-                "extra_slippage": self.extra_slippage,
+                "brokerage_rupees": self.brokerage_rupees,
+                "exchange_charges_rupees": self.exchange_charges_rupees,
+                "taxes_rupees": self.taxes_rupees,
+                "gst_rupees": self.gst_rupees,
+                "regulatory_fees_rupees": self.regulatory_fees_rupees,
+                "stamp_duty_rupees": self.stamp_duty_rupees,
+                "spread_rupees": self.spread_rupees,
+                "extra_slippage_rupees": self.extra_slippage_rupees,
             }
         )
 
     @property
-    def total(self) -> float:
+    def total_rupees(self) -> float:
         return sum(self.components.values())
+
+    # Compatibility aliases retain the original terse read API. New reports and
+    # component maps always use explicit INR/rupee field names.
+    @property
+    def brokerage(self) -> float:
+        return self.brokerage_rupees
+
+    @property
+    def exchange_charges(self) -> float:
+        return self.exchange_charges_rupees
+
+    @property
+    def taxes(self) -> float:
+        return self.taxes_rupees
+
+    @property
+    def gst(self) -> float:
+        return self.gst_rupees
+
+    @property
+    def regulatory_fees(self) -> float:
+        return self.regulatory_fees_rupees
+
+    @property
+    def stamp_duty(self) -> float:
+        return self.stamp_duty_rupees
+
+    @property
+    def spread(self) -> float:
+        return self.spread_rupees
+
+    @property
+    def extra_slippage(self) -> float:
+        return self.extra_slippage_rupees
+
+    @property
+    def total(self) -> float:
+        return self.total_rupees
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,18 +203,23 @@ class CostSchedule:
         extra_slippage = turnover * self.rates.extra_slippage_bps / 10_000
         return CostBreakdown(
             version=self.version,
-            brokerage=brokerage,
-            exchange_charges=exchange,
-            taxes=taxes,
-            gst=gst,
-            regulatory_fees=regulatory,
-            stamp_duty=stamp_duty,
-            spread=spread,
-            extra_slippage=extra_slippage,
+            brokerage_rupees=brokerage,
+            exchange_charges_rupees=exchange,
+            taxes_rupees=taxes,
+            gst_rupees=gst,
+            regulatory_fees_rupees=regulatory,
+            stamp_duty_rupees=stamp_duty,
+            spread_rupees=spread,
+            extra_slippage_rupees=extra_slippage,
         )
 
     def report(self) -> Mapping[str, object]:
         """Serializable schedule metadata for every replay report."""
         return MappingProxyType(
-            {"version": self.version, "rates": self.rates.as_dict()}
+            {
+                "version": self.version,
+                "currency": "INR",
+                "monetary_unit": "rupees",
+                "rates": self.rates.as_dict(),
+            }
         )

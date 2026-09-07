@@ -1,5 +1,8 @@
+import pytest
+
 from nifty_signal_engine.backtesting.fills import (
     ExecutableQuote,
+    Fill,
     FillSimulator,
     RejectionCode,
     TradeCandidate,
@@ -54,3 +57,22 @@ def test_quote_at_or_before_signal_is_never_an_executable_next_quote() -> None:
     result = FillSimulator().enter_long(candidate, quote)
 
     assert result.code is RejectionCode.NOT_NEXT_QUOTE
+
+
+def test_candidate_quantity_must_be_an_integral_positive_lot_count() -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        TradeCandidate(aware("2026-08-26T10:00:00+05:30"), "contract", quantity=1.0)
+
+
+def test_fill_price_must_stay_inside_the_executable_bid_ask_range() -> None:
+    candidate = TradeCandidate(aware("2026-08-26T10:00:00+05:30"), "contract")
+
+    with pytest.raises(ValueError, match="within bid/ask"):
+        Fill(
+            candidate=candidate,
+            executed_at=aware("2026-08-26T10:00:15+05:30"),
+            price=102,
+            quantity=1,
+            bid=99,
+            ask=101,
+        )
