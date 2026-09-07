@@ -29,6 +29,9 @@ class QualityConfig:
     maximum_relative_spread: float = 0.2
     maximum_source_age: timedelta = MAX_SOURCE_AGE
     maximum_receipt_age: timedelta = MAX_SOURCE_AGE
+    require_authoritative_source_time: bool = True
+    require_authoritative_quote_time: bool = True
+    require_valid_iv: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +125,7 @@ def assess_snapshot(
 
     age = checked_at - source_timestamp
     receipt_age = checked_at - received_at
-    if not current.source_time_authoritative:
+    if config.require_authoritative_source_time and not current.source_time_authoritative:
         add(DataQualityCode.SOURCE_TIME_UNAVAILABLE, "source_time", "not_authoritative")
     if age > config.maximum_source_age:
         add(
@@ -186,7 +189,7 @@ def assess_snapshot(
         for quote in current.quotes
     ):
         add(DataQualityCode.EXCESSIVE_SPREAD, "spread", "relative_spread_exceeds_limit")
-    if any(not _iv_is_valid(quote) for quote in current.quotes):
+    if config.require_valid_iv and any(not _iv_is_valid(quote) for quote in current.quotes):
         add(DataQualityCode.INVALID_IV, "iv", "missing_or_out_of_range")
     if any(not _greeks_are_valid(quote) for quote in current.quotes):
         add(DataQualityCode.INVALID_GREEKS, "greeks", "missing_or_non_finite")
@@ -196,7 +199,7 @@ def assess_snapshot(
             "expiry",
             "quote_expiry_differs_from_snapshot",
         )
-    if any(not quote.timestamp_authoritative for quote in current.quotes):
+    if config.require_authoritative_quote_time and any(not quote.timestamp_authoritative for quote in current.quotes):
         add(DataQualityCode.QUOTE_TIME_UNAVAILABLE, "quote_time", "not_authoritative")
     if any(
         _as_ist(quote.timestamp, "quote.timestamp") > source_timestamp

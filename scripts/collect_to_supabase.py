@@ -19,7 +19,8 @@ from nifty_signal_engine.data.supabase_rest import (
     SupabaseRestSettings,
     snapshot_row,
 )
-from nifty_signal_engine.monitoring.data_quality import assess_snapshot
+from nifty_signal_engine.domain.market import OptionChainSnapshot
+from nifty_signal_engine.monitoring.data_quality import QualityConfig, TradingCalendar, assess_snapshot
 
 IST = ZoneInfo("Asia/Kolkata")
 Instrument = Literal["NIFTY", "BANKNIFTY"]
@@ -41,11 +42,41 @@ async def collect(instrument: Instrument) -> None:
     raw = await client.fetch_option_chain(instrument, expiries[0])
     received_at = raw.captured_at.astimezone(IST)
     snapshot = normalize_option_chain(raw, instrument, received_at)
+    repository = SupabaseRestClient(settings)
+    prior_rows = repository.select(
+        "market_snapshots",
+        query={
+            "select": "normalized_payload,source_timestamp",
+            "instrument": f"eq.{instrument}",
+            "session_date": f"eq.{snapshot.source_timestamp.date().isoformat()}",
+            "order": "source_timestamp.desc,id.desc",
+            "limit": "1",
+        },
+    )
+    previous = None
+    if prior_rows:
+        payload = prior_rows[0].get("normalized_payload")
+        if isinstance(payload, dict):
+            try:
+                previous = OptionChainSnapshot.model_validate(payload)
+            except (TypeError, ValueError):
+                previous = None
+    # Dhan supplies a local HTTP receipt rather than an exchange timestamp.
+    # It is suitable for freshness checks, while the dashboard still records
+    # the provenance as non-authoritative.  Deep OTM quotes can also have very
+    # wide markets or no IV; those are excluded by downstream feature gates.
     quality = assess_snapshot(
         snapshot,
-        None,
+        previous,
         datetime.now(IST),
+        calendar=TradingCalendar({snapshot.source_timestamp.date()}),
         active_expiries=expiries,
+        config=QualityConfig(
+            maximum_relative_spread=1.0,
+            require_authoritative_source_time=False,
+            require_authoritative_quote_time=False,
+            require_valid_iv=False,
+        ),
     )
     row = snapshot_row(
         raw_payload=raw.body,
@@ -58,7 +89,7 @@ async def collect(instrument: Instrument) -> None:
         source="dhan",
         source_time_authoritative=snapshot.source_time_authoritative,
     )
-    SupabaseRestClient(settings).insert("market_snapshots", row)
+    repository.insert("market_snapshots", row)
     print(f"published {instrument} {snapshot.source_timestamp.isoformat()}")
 
 
