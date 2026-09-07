@@ -1,5 +1,7 @@
 # NIFTY Signal Engine
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Precision-first research infrastructure for NIFTY and BANKNIFTY options. The engine converts timestamped option-chain observations into auditable exposures, Greeks, zero-levels, causal features, calibrated directional research, realistic replay results, and walk-forward validation reports.
 
 > **Current status:** research and shadow-monitoring only. Every public signal is explicitly `RESEARCH / NO_TRADE`. No broker credentials, order submission, or live execution path is included.
@@ -78,6 +80,13 @@ The collector currently publishes audited market snapshots and provenance.
 Feature/research artifacts remain governed outputs and are shown only when
 their own validated artifacts exist. Supabase Cron or another scheduler can be
 used instead of GitHub Actions if preferred.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE). The license permits
+use, modification, and redistribution subject to preservation of the copyright
+and license notice. Market data providers, broker APIs, and third-party assets
+remain subject to their own terms and licenses.
 
 ## Data and provenance
 
